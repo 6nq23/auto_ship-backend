@@ -1,0 +1,63 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  admin
+  packer
+}
+
+enum ShippingJobStatus {
+  queued
+  processing
+  completed
+  failed
+}
+
+model User {
+  id                 Int      @id @default(autoincrement())
+  username           String
+  usernameNormalized String   @unique @map("username_normalized")
+  passwordHash       String   @map("password_hash")
+  role               Role
+  createdAt          DateTime @default(now()) @map("created_at")
+
+  @@map("users")
+}
+
+model OrderCache {
+  orderNumber String   @id @map("order_number")
+  orderId     String   @map("order_id")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("order_cache")
+}
+
+model ShippingBatch {
+  batchId   String   @id @default(uuid()) @db.Uuid @map("batch_id")
+  createdAt DateTime @map("created_at")
+  shippedBy String   @map("shipped_by")
+  payload   Json
+
+  @@index([createdAt(sort: Desc)])
+  @@map("shipping_batches")
+}
+
+model ShippingJob {
+  jobId          String            @id @default(uuid()) @db.Uuid @map("job_id")
+  createdAt      DateTime          @map("created_at")
+  updatedAt      DateTime          @map("updated_at")
+  createdBy      String            @map("created_by")
+  status         ShippingJobStatus
+  activeOwnerKey String?           @unique @map("active_owner_key")
+  leaseUntil     DateTime?         @map("lease_until")
+  payload        Json
+
+  @@index([createdBy, updatedAt(sort: Desc)])
+  @@index([status, createdAt])
+  @@map("shipping_jobs")
+}
