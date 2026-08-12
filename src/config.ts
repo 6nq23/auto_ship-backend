@@ -17,7 +17,7 @@ export function loadConfig(): AppConfig {
 
   return {
     jwtSecret: process.env.JWT_SECRET || "local-demo-secret-not-for-production-use",
-    clientOrigin: process.env.CLIENT_ORIGIN || "http://localhost:5173",
+    clientOrigin: process.env.CLIENT_ORIGIN || "http://localhost:5173,https://auto-ship-client.vercel.app",
     databaseUrl: process.env.DATABASE_URL,
     databaseSsl: process.env.DATABASE_SSL === "true",
     mockMode,

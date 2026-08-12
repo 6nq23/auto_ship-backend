@@ -35,6 +35,11 @@ export async function createApp(config: AppConfig, storeOverride?: Store, schedu
   const store = storeOverride || new PrismaStore(config.databaseUrl, config.databaseSsl, config.mockMode, config.initialAdminPassword); await store.init();
   const runInBackground: BackgroundScheduler = scheduleBackground || ((task) => { void task.catch((error) => console.error("Background task failed", error)); });
   const nimbus = new NimbusClient({ apiUrl: config.nimbusApiUrl, apiKey: config.nimbusApiKey, apiSecret: config.nimbusApiSecret, maxPages: config.maxLookupPages, mockMode: config.mockMode }, { getOrderId: (order) => store.getOrderId(order), cacheOrder: (order, id) => store.cacheOrder(order, id) });
+  const allowedOrigins = new Set([
+    "http://localhost:5173",
+    "https://auto-ship-client.vercel.app",
+    ...config.clientOrigin.split(",").map((origin) => origin.trim().replace(/\/$/, "")).filter(Boolean),
+  ]);
   const app = express();
   app.set("trust proxy", 1);
   app.disable("x-powered-by");
@@ -51,7 +56,14 @@ export async function createApp(config: AppConfig, storeOverride?: Store, schedu
     xPermittedCrossDomainPolicies(),
     xXssProtection(),
   );
-  app.use(cors({ origin: config.clientOrigin, credentials: false })); app.use(express.json({ limit: "32kb" }));
+  app.use(cors({
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.has(origin.replace(/\/$/, ""))) return callback(null, true);
+      return callback(null, false);
+    },
+    credentials: false,
+  }));
+  app.use(express.json({ limit: "32kb" }));
   const authenticate = (request: AuthRequest, response: Response, next: NextFunction) => { const token = request.headers.authorization?.replace(/^Bearer\s+/i, ""); if (!token) return response.status(401).json({ error: "Please sign in to continue." }); try { request.auth = jwt.verify(token, config.jwtSecret) as { username: string; role: Role }; next(); } catch { response.status(401).json({ error: "Your session has expired. Please sign in again." }); } };
   const adminOnly = (request: AuthRequest, response: Response, next: NextFunction) => request.auth?.role === "admin" ? next() : response.status(403).json({ error: "Admin access is required." });
   const authLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 20, standardHeaders: "draft-7", legacyHeaders: false });
