@@ -1,6 +1,8 @@
 import path from "node:path";
 import fs from "node:fs";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { fileURLToPath } from "node:url";
+import { waitUntil } from "@vercel/functions";
 import express, { type NextFunction, type Request, type Response } from "express";
 import cors from "cors";
 import {
@@ -20,6 +22,7 @@ import { rateLimit } from "express-rate-limit";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import { PrismaStore, type Store } from "./store.js";
+import { loadConfig } from "./config.js";
 import { NimbusClient } from "./nimbus.js";
 import type { Batch, NimbusProgressEvent, Role, ShippingJob, ShippingLog } from "./types.js";
 
@@ -147,4 +150,23 @@ export async function createApp(config: AppConfig, storeOverride?: Store, schedu
   app.use((error: unknown, _request: Request, response: Response, _next: NextFunction) => { console.error(error); response.status(500).json({ error: "The request could not be completed. Please try again." }); });
   for (const pendingJob of await store.getPendingShippingJobs()) runInBackground(processJob(pendingJob.jobId));
   return app;
+}
+
+let serverlessAppPromise: ReturnType<typeof createApp> | undefined;
+
+/**
+ * Vercel's Express auto-detection treats src/app.ts as a function entrypoint.
+ * Keep initialization lazy so importing this module during the build does not
+ * connect to PostgreSQL, and reuse the Express app across warm invocations.
+ */
+export default async function handler(request: IncomingMessage, response: ServerResponse) {
+  if (!serverlessAppPromise) {
+    serverlessAppPromise = createApp(loadConfig(), undefined, (task) => waitUntil(task)).catch((error) => {
+      serverlessAppPromise = undefined;
+      throw error;
+    });
+  }
+
+  const app = await serverlessAppPromise;
+  return app(request, response);
 }

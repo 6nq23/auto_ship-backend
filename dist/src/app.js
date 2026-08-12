@@ -1,13 +1,15 @@
 import path from "node:path";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
+import { waitUntil } from "@vercel/functions";
 import express from "express";
 import cors from "cors";
-import helmet from "helmet";
-import rateLimit from "express-rate-limit";
+import { contentSecurityPolicy, crossOriginOpenerPolicy, originAgentCluster, referrerPolicy, strictTransportSecurity, xContentTypeOptions, xDnsPrefetchControl, xDownloadOptions, xFrameOptions, xPermittedCrossDomainPolicies, xXssProtection, } from "helmet";
+import { rateLimit } from "express-rate-limit";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import { PrismaStore } from "./store.js";
+import { loadConfig } from "./config.js";
 import { NimbusClient } from "./nimbus.js";
 export async function createApp(config, storeOverride, scheduleBackground) {
     const store = storeOverride || new PrismaStore(config.databaseUrl, config.databaseSsl, config.mockMode, config.initialAdminPassword);
@@ -17,7 +19,7 @@ export async function createApp(config, storeOverride, scheduleBackground) {
     const app = express();
     app.set("trust proxy", 1);
     app.disable("x-powered-by");
-    app.use(helmet({ crossOriginResourcePolicy: false }));
+    app.use(contentSecurityPolicy(), crossOriginOpenerPolicy(), originAgentCluster(), referrerPolicy(), strictTransportSecurity(), xContentTypeOptions(), xDnsPrefetchControl(), xDownloadOptions(), xFrameOptions(), xPermittedCrossDomainPolicies(), xXssProtection());
     app.use(cors({ origin: config.clientOrigin, credentials: false }));
     app.use(express.json({ limit: "32kb" }));
     const authenticate = (request, response, next) => { const token = request.headers.authorization?.replace(/^Bearer\s+/i, ""); if (!token)
@@ -220,4 +222,20 @@ export async function createApp(config, storeOverride, scheduleBackground) {
     for (const pendingJob of await store.getPendingShippingJobs())
         runInBackground(processJob(pendingJob.jobId));
     return app;
+}
+let serverlessAppPromise;
+/**
+ * Vercel's Express auto-detection treats src/app.ts as a function entrypoint.
+ * Keep initialization lazy so importing this module during the build does not
+ * connect to PostgreSQL, and reuse the Express app across warm invocations.
+ */
+export default async function handler(request, response) {
+    if (!serverlessAppPromise) {
+        serverlessAppPromise = createApp(loadConfig(), undefined, (task) => waitUntil(task)).catch((error) => {
+            serverlessAppPromise = undefined;
+            throw error;
+        });
+    }
+    const app = await serverlessAppPromise;
+    return app(request, response);
 }

@@ -1,18 +1,3 @@
-import type { IncomingMessage, ServerResponse } from "node:http";
-import { waitUntil } from "@vercel/functions";
-import { createApp } from "../src/app.js";
-import { loadConfig } from "../src/config.js";
-
-let appPromise: ReturnType<typeof createApp> | undefined;
-
-export default async function handler(request: IncomingMessage, response: ServerResponse) {
-  if (!appPromise) {
-    appPromise = createApp(loadConfig(), undefined, (task) => waitUntil(task)).catch((error) => {
-      appPromise = undefined;
-      throw error;
-    });
-  }
-
-  const app = await appPromise;
-  return app(request, response);
-}
+// Explicit /api entrypoint for vercel.json. The same handler is also exported
+// directly by src/app.ts for Vercel's automatic Express app detection.
+export { default } from "../src/app.js";
