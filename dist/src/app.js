@@ -11,17 +11,35 @@ import bcrypt from "bcryptjs";
 import { PrismaStore } from "./store.js";
 import { loadConfig } from "./config.js";
 import { NimbusClient } from "./nimbus.js";
+import { ShopifyClient } from "./shopify.js";
+import { WhatsAppClient } from "./whatsapp.js";
+import { WhatsAppRouter } from "./whatsapp-router.js";
 export async function createApp(config, storeOverride, scheduleBackground) {
     const store = storeOverride || new PrismaStore(config.databaseUrl, config.databaseSsl, config.mockMode, config.initialAdminPassword);
     await store.init();
     const runInBackground = scheduleBackground || ((task) => { void task.catch((error) => console.error("Background task failed", error)); });
     const nimbus = new NimbusClient({ apiUrl: config.nimbusApiUrl, apiKey: config.nimbusApiKey, apiSecret: config.nimbusApiSecret, maxPages: config.maxLookupPages, mockMode: config.mockMode }, { getOrderId: (order) => store.getOrderId(order), cacheOrder: (order, id) => store.cacheOrder(order, id) });
+    const shopify = new ShopifyClient({ storeDomain: config.shopifyStoreDomain || "", clientId: config.shopifyClientId || "", clientSecret: config.shopifyClientSecret || "", accessToken: config.shopifyAccessToken, apiVersion: config.shopifyApiVersion, mockMode: config.mockMode });
+    const whatsapp = new WhatsAppClient({ provider: config.whatsappProvider || "disabled", accessToken: config.whatsappAccessToken || "", phoneNumberId: config.whatsappPhoneNumberId, verifyToken: config.whatsappVerifyToken, appSecret: config.whatsappAppSecret, apiUrl: config.whatsappApiUrl, serviceApiUrl: config.whatsappServiceApiUrl, sender: config.whatsappSender, campaignId: config.whatsappCampaignId, templateName: config.whatsappTemplateName, templateLanguage: config.whatsappTemplateLanguage, mockMode: config.mockMode });
+    const whatsappRouter = new WhatsAppRouter({ store, shopify, nimbus, whatsapp, supportPhone: config.supportPhone || "" });
+    const allowedOrigins = new Set([
+        "http://localhost:5173",
+        "https://auto-ship-client.vercel.app",
+        ...config.clientOrigin.split(",").map((origin) => origin.trim().replace(/\/$/, "")).filter(Boolean),
+    ]);
     const app = express();
     app.set("trust proxy", 1);
     app.disable("x-powered-by");
     app.use(contentSecurityPolicy(), crossOriginOpenerPolicy(), originAgentCluster(), referrerPolicy(), strictTransportSecurity(), xContentTypeOptions(), xDnsPrefetchControl(), xDownloadOptions(), xFrameOptions(), xPermittedCrossDomainPolicies(), xXssProtection());
-    app.use(cors({ origin: config.clientOrigin, credentials: false }));
-    app.use(express.json({ limit: "32kb" }));
+    app.use(cors({
+        origin: (origin, callback) => {
+            if (!origin || allowedOrigins.has(origin.replace(/\/$/, "")))
+                return callback(null, true);
+            return callback(null, false);
+        },
+        credentials: false,
+    }));
+    app.use(express.json({ limit: "32kb", verify: (request, _response, buffer) => { request.rawBody = Buffer.from(buffer); } }));
     const authenticate = (request, response, next) => { const token = request.headers.authorization?.replace(/^Bearer\s+/i, ""); if (!token)
         return response.status(401).json({ error: "Please sign in to continue." }); try {
         request.auth = jwt.verify(token, config.jwtSecret);
@@ -32,6 +50,7 @@ export async function createApp(config, storeOverride, scheduleBackground) {
     } };
     const adminOnly = (request, response, next) => request.auth?.role === "admin" ? next() : response.status(403).json({ error: "Admin access is required." });
     const authLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 20, standardHeaders: "draft-7", legacyHeaders: false });
+    const webhookLimiter = rateLimit({ windowMs: 60_000, limit: 1_000, standardHeaders: "draft-7", legacyHeaders: false });
     const sessionFor = (username, role) => { const user = { username, role }; return { token: jwt.sign(user, config.jwtSecret, { expiresIn: "7d", issuer: "autoship" }), user, demoMode: config.mockMode }; };
     const orderNumbersFrom = (body) => {
         const values = body?.orderNumbers;
@@ -79,7 +98,9 @@ export async function createApp(config, storeOverride, scheduleBackground) {
                 if (event.type === "shipped") {
                     job.shipped.push(event.item);
                     job.processed = job.shipped.length + job.failed.length;
-                    appendLog(job, "success", `${event.item.alreadyBooked ? "Already booked" : "Booked"} with ${event.item.courier}; AWB ${event.item.awb}.`, event.orderNumber);
+                    if (event.item.warning)
+                        appendLog(job, "error", `[${event.item.warningCode || "SHIPMENT_WARNING"}] ${event.item.warning} Existing shipment recovered and counted as shipped.`, event.orderNumber);
+                    appendLog(job, "success", `${event.item.alreadyBooked ? "Already booked" : "Booked"} with ${event.item.courier}; AWB ${event.item.awb || "available in NimbusPost"}.`, event.orderNumber);
                 }
                 if (event.type === "failed") {
                     job.failed.push(event.item);
@@ -122,6 +143,28 @@ export async function createApp(config, storeOverride, scheduleBackground) {
         }
     };
     app.get("/api/health", (_request, response) => response.json({ status: "ok", demoMode: config.mockMode }));
+    app.get("/api/whatsapp/webhook", (request, response) => {
+        const challenge = whatsapp.verifyChallenge(request.query);
+        return challenge ? response.status(200).send(challenge) : response.status(403).send("Webhook verification failed");
+    });
+    app.post("/api/whatsapp/webhook", webhookLimiter, async (request, response, next) => {
+        try {
+            const rawBody = request.rawBody || Buffer.from(JSON.stringify(request.body));
+            const signature = request.header("x-hub-signature-256") || request.header("x-webhook-signature") || undefined;
+            const queryToken = typeof request.query.token === "string" ? request.query.token : undefined;
+            const webhookToken = request.header("x-autoship-webhook-token") || queryToken;
+            if (!whatsapp.verifySignature(rawBody, signature, webhookToken))
+                return response.status(401).json({ error: "Invalid webhook signature" });
+            const manualMessages = whatsapp.extractManualMessages(request.body);
+            await Promise.all(manualMessages.map((message) => whatsappRouter.handleManualAgentMessage(message)));
+            const messages = whatsapp.extractMessages(request.body);
+            await Promise.all(messages.map((message) => whatsappRouter.handleIncomingMessage(message)));
+            response.sendStatus(200);
+        }
+        catch (error) {
+            next(error);
+        }
+    });
     app.post("/api/auth/register", authLimiter, async (request, response, next) => {
         try {
             const username = typeof request.body?.username === "string" ? request.body.username.trim() : "";
@@ -208,7 +251,54 @@ export async function createApp(config, storeOverride, scheduleBackground) {
     catch (error) {
         next(error);
     } });
-    app.get("/api/settings/status", authenticate, adminOnly, (_request, response) => response.json({ connected: !config.mockMode && Boolean(config.nimbusApiKey && config.nimbusApiSecret), demoMode: config.mockMode, apiUrl: config.nimbusApiUrl, database: "PostgreSQL" }));
+    app.post("/api/history/:batchId/label", authenticate, async (request, response, next) => {
+        try {
+            const batch = (await store.getHistory()).find((item) => item.batchId === String(request.params.batchId));
+            if (!batch)
+                return response.status(404).json({ error: "Shipping batch was not found." });
+            if (!batch.shipped.length)
+                return response.status(400).json({ error: "This batch has no successful shipments to print." });
+            const labelUrl = await nimbus.generateLabels(batch.shipped.map((item) => item.orderId));
+            response.json({ labelUrl });
+        }
+        catch (error) {
+            next(error);
+        }
+    });
+    app.get("/api/support/overview", authenticate, adminOnly, async (_request, response, next) => { try {
+        response.json({ ...(await store.getSupportOverview()), connections: { whatsapp: whatsapp.connected, shopify: shopify.connected, nimbus: config.mockMode || Boolean(config.nimbusApiKey && config.nimbusApiSecret) } });
+    }
+    catch (error) {
+        next(error);
+    } });
+    app.patch("/api/support/tickets/:ticketId", authenticate, adminOnly, async (request, response, next) => {
+        try {
+            const status = request.body?.status;
+            if (!["open", "resolved"].includes(status))
+                return response.status(400).json({ error: "Status must be open or resolved." });
+            if (!(await store.updateSupportTicket(String(request.params.ticketId), status)))
+                return response.status(404).json({ error: "Support ticket was not found." });
+            response.json({ updated: true });
+        }
+        catch (error) {
+            next(error);
+        }
+    });
+    app.patch("/api/support/bot-pauses/:phone", authenticate, adminOnly, async (request, response, next) => {
+        try {
+            const phone = String(request.params.phone || "").replace(/\D/g, "");
+            if (phone.length < 10 || phone.length > 15)
+                return response.status(400).json({ error: "A valid WhatsApp phone number is required." });
+            if (typeof request.body?.paused !== "boolean")
+                return response.status(400).json({ error: "paused must be true or false." });
+            await store.setBotPaused(phone, request.body.paused, "manual");
+            response.json({ phone, paused: request.body.paused });
+        }
+        catch (error) {
+            next(error);
+        }
+    });
+    app.get("/api/settings/status", authenticate, adminOnly, (_request, response) => response.json({ connected: !config.mockMode && Boolean(config.nimbusApiKey && config.nimbusApiSecret), demoMode: config.mockMode, apiUrl: config.nimbusApiUrl, database: "PostgreSQL", support: { whatsapp: whatsapp.connected, shopify: shopify.connected } }));
     app.get("/demo-labels", (_request, response) => response.type("html").send("<title>AutoShip demo labels</title><style>body{font-family:system-ui;padding:40px}code{font-size:18px}</style><h1>Demo label bundle</h1><p>Live mode returns NimbusPost’s merged PDF here.</p>"));
     const clientDist = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../client/dist");
     if (fs.existsSync(path.join(clientDist, "index.html"))) {

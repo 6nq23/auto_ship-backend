@@ -5,8 +5,10 @@ const { Pool } = pg;
 const globalState = globalThis;
 export function getPrisma(databaseUrl, ssl) {
     const existing = globalState.__autoshipPrisma;
-    if (existing?.client && existing.databaseUrl === databaseUrl)
+    if (existing?.client && existing.databaseUrl === databaseUrl && existing.ssl === ssl)
         return existing.client;
+    if (existing?.pool)
+        void existing.pool.end().catch((error) => console.error("Failed to close the previous PostgreSQL pool", error.message));
     const pool = new Pool({
         connectionString: databaseUrl,
         ssl: ssl ? { rejectUnauthorized: false } : false,
@@ -16,6 +18,6 @@ export function getPrisma(databaseUrl, ssl) {
     });
     pool.on("error", (error) => console.error("PostgreSQL pool error", error.message));
     const client = new PrismaClient({ adapter: new PrismaPg(pool) });
-    globalState.__autoshipPrisma = { databaseUrl, pool, client };
+    globalState.__autoshipPrisma = { databaseUrl, ssl, pool, client };
     return client;
 }

@@ -1,26 +1,24 @@
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
 import { PrismaStore } from "./src/store.js";
-import path from "path";
-import { fileURLToPath } from "url";
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-dotenv.config({ path: path.join(__dirname, '..', '.env') });
+const serverDirectory = path.dirname(fileURLToPath(import.meta.url));
+dotenv.config({ path: path.join(serverDirectory, "..", ".env") });
 async function initDb() {
-    const dbUrl = process.env.DATABASE_URL;
-    if (!dbUrl) {
-        console.error("DATABASE_URL is not set in .env");
-        process.exit(1);
-    }
-    const ssl = process.env.DATABASE_SSL === "true";
-    const initialPassword = process.env.INITIAL_ADMIN_PASSWORD || "admin123";
-    console.log("Connecting to database...");
-    const store = new PrismaStore(dbUrl, ssl, false, initialPassword);
+    const databaseUrl = process.env.DATABASE_URL;
+    if (!databaseUrl)
+        throw new Error("DATABASE_URL is not set in .env");
+    const store = new PrismaStore(databaseUrl, process.env.DATABASE_SSL === "true", false, process.env.INITIAL_ADMIN_PASSWORD || "admin123");
     try {
-        console.log("Seeding the initial admin account...");
+        console.info("Connecting to PostgreSQL and initializing AutoShip...");
         await store.init();
-        console.log("Database seed completed successfully!");
+        console.info("Database initialization completed successfully.");
     }
-    catch (error) {
-        console.error("Failed to initialize database:", error);
+    finally {
+        await store.close();
     }
 }
-initDb();
+initDb().catch((error) => {
+    console.error("Failed to initialize the database:", error instanceof Error ? error.message : error);
+    process.exitCode = 1;
+});
