@@ -18,7 +18,7 @@ export const COURIER_PRIORITY = [
 export class NimbusClient {
   constructor(private readonly config: NimbusConfig, private readonly cache: { getOrderId: (order: string) => Promise<string | undefined>; cacheOrder: (order: string, id: string) => Promise<void> }) {}
 
-  async shipMany(orderNumbers: string[], concurrency = 5, onProgress?: (event: NimbusProgressEvent) => Promise<void>) {
+  async shipMany(orderNumbers: string[], concurrency = 5, onProgress?: (event: NimbusProgressEvent) => Promise<void>, generateLabels = true) {
     const shipped: ShippedOrder[] = []; const failed: FailedOrder[] = []; let cursor = 0;
     const worker = async () => { while (cursor < orderNumbers.length) {
       const orderNumber = orderNumbers[cursor++]; const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), 60_000);
@@ -31,13 +31,13 @@ export class NimbusClient {
     shipped.sort((a, b) => orderNumbers.indexOf(a.orderNumber) - orderNumbers.indexOf(b.orderNumber));
     failed.sort((a, b) => orderNumbers.indexOf(a.orderNumber) - orderNumbers.indexOf(b.orderNumber));
     let labelUrl: string | null = null; let pickupScheduledLabelUrl: string | null = null;
-    if (shipped.length) {
+    if (generateLabels && shipped.length) {
       await onProgress?.({ type: "labels_started", count: shipped.length });
       try { labelUrl = await this.labels(shipped.map((item) => item.orderId)); await onProgress?.({ type: "labels_ready", labelUrl }); }
       catch (error) { const parsed = this.describeError(error); await onProgress?.({ type: "labels_failed", error: parsed.error }); }
     }
     const pickupScheduled = shipped.filter((item) => item.warningCode === "PICKUP_ALREADY_SCHEDULED");
-    if (pickupScheduled.length) {
+    if (generateLabels && pickupScheduled.length) {
       await onProgress?.({ type: "pickup_labels_started", count: pickupScheduled.length });
       try { pickupScheduledLabelUrl = await this.labels(pickupScheduled.map((item) => item.orderId)); await onProgress?.({ type: "pickup_labels_ready", labelUrl: pickupScheduledLabelUrl }); }
       catch (error) { const parsed = this.describeError(error); await onProgress?.({ type: "pickup_labels_failed", error: parsed.error }); }

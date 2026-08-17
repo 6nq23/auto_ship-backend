@@ -21,9 +21,12 @@ export function getPrisma(databaseUrl: string, ssl: boolean) {
   const pool = new Pool({
     connectionString: databaseUrl,
     ssl: ssl ? { rejectUnauthorized: false } : false,
-    max: process.env.VERCEL ? 1 : 10,
-    idleTimeoutMillis: 10_000,
-    connectionTimeoutMillis: 5_000,
+    // The background shipper and the browser's progress poll can overlap in
+    // one warm Vercel function. Keep this small, but do not force both through
+    // one connection or discard an idle connection between NimbusPost calls.
+    max: process.env.VERCEL ? 2 : 10,
+    idleTimeoutMillis: 60_000,
+    connectionTimeoutMillis: 20_000,
   });
   pool.on("error", (error) => console.error("PostgreSQL pool error", error.message));
 

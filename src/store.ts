@@ -208,6 +208,9 @@ export class PrismaStore implements Store {
         updatedAt: new Date(job.updatedAt),
         status: job.status,
         activeOwnerKey: job.status === "queued" || job.status === "processing" ? job.createdBy.toLowerCase() : null,
+        // A queued job is between durable chunks and must be claimable by the
+        // next polling/serverless invocation. Terminal jobs no longer need a lease.
+        leaseUntil: job.status === "processing" ? undefined : null,
         payload: asJson(job),
       },
     });
