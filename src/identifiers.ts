@@ -1,15 +1,25 @@
 const compactDigits = (value: string) => value.replace(/\D/g, "");
 
+/** Extract the numeric suffix customers use for a Shopify order reference. */
+export const extractOrderSuffix = (value: string): string | undefined => {
+  const tagged = value.match(/#?\s*[A-Za-z]{1,8}[\s#:_-]*((?:\d[\s-]*){1,5})(?![\s-]*\d)/);
+  if (tagged) return compactDigits(tagged[1]);
+
+  // A standalone 4–5 digit reply is an order suffix. Longer digit strings may
+  // be phone numbers, postal PINs, AWBs, or other identifiers.
+  if (!/^\s*#?\s*(?:\d[\s-]*){4,5}\s*$/.test(value)) return undefined;
+  return compactDigits(value) || undefined;
+};
+
 /** Convert customer-entered Shopify order references to the store's #RBD123 format. */
 export const normalizeOrderNumber = (value: string): string | undefined => {
-  const tagged = value.match(/#?\s*R\s*B\s*D[\s#:_-]*((?:\d[\s-]*){1,18})/i);
+  const tagged = value.match(/#?\s*R\s*B\s*D[\s#:_-]*((?:\d[\s-]*){1,5})(?![\s-]*\d)/i);
   if (tagged) {
     const suffix = compactDigits(tagged[1]);
     return suffix ? `#RBD${suffix}` : undefined;
   }
 
-  // A short, digits-only reply is an order suffix. Ten or more digits is a phone.
-  if (!/^\s*#?\s*(?:\d[\s-]*){3,9}\s*$/.test(value)) return undefined;
+  if (!/^\s*#?\s*(?:\d[\s-]*){4,5}\s*$/.test(value)) return undefined;
   const suffix = compactDigits(value);
   return suffix ? `#RBD${suffix}` : undefined;
 };

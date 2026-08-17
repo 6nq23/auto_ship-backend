@@ -4,7 +4,7 @@ import type { NimbusClient } from "./nimbus.js";
 import type { ShopifyClient } from "./shopify.js";
 import type { IncomingWhatsAppMessage, WhatsAppClient } from "./whatsapp.js";
 import type { AiProviderName, AiToolCall, ChatMessage, OrderMatch, ShopifyAddress, ShopifyOrder, SupportConversation, SupportIntent, SupportTicket } from "./types.js";
-import { extractPhoneNumber, normalizeOrderNumber, normalizePhoneNumber } from "./identifiers.js";
+import { extractOrderSuffix, extractPhoneNumber, normalizeOrderNumber, normalizePhoneNumber } from "./identifiers.js";
 import type { AiOrchestrator } from "./ai-providers.js";
 
 const INTENTS: Record<string, SupportIntent> = {
@@ -17,7 +17,7 @@ const INTENTS: Record<string, SupportIntent> = {
 };
 
 const KEYWORDS: Array<[SupportIntent, RegExp]> = [
-  ["refund_return", /\b(refund|return|missing|wrong item|galat item|paisa wapas|nahi aaya|rakhi nahi)\b/i],
+  ["refund_return", /\b(refund|return|exchange|replace(?:ment)?|missing|wrong item|galat item|paisa wapas|badalna|nahi aaya|rakhi nahi)\b/i],
   ["order_failed", /\b(fail(?:ed)?|delivery fail|deliver nahi|nahi mila|attempt|undelivered|return ho gaya|ndr)\b/i],
   ["not_dispatched", /\b(not dispatch|dispatch nahi|not ship|ship nahi|kab bhejoge|nahi bheja|why not shipped)\b/i],
   ["change_address", /\b(address|phone|number)\b.*\b(change|update|badlo|galat|wrong)\b|\b(change|update|badlo|galat|wrong)\b.*\b(address|phone|number)\b/i],
@@ -100,17 +100,23 @@ export class WhatsAppRouter {
     const messages: ChatMessage[] = history.map((message) => ({ role: message.direction === "inbound" ? "user" : "assistant", content: message.text }));
     const response = await ai.chat(messages, await this.loadBrain());
     const toolCall = response.toolCalls?.[0];
-    if (toolCall) return this.executeAiTool(phone, toolCall);
-    if (response.escalate) return this.escalateToHuman(phone, response.text || "AI requested human support", "other");
+    if (toolCall) return this.executeAiTool(phone, toolCall, response.text);
+    const directIdentifier = extractOrderNumber(text) || extractPhoneNumber(text);
+    if (directIdentifier && !response.resolved) return this.resolveIdentifier(phone, inferIntent(messages) || "order_status", directIdentifier);
+    if (response.escalate) {
+      const customerText = messages.filter((item) => item.role === "user").map((item) => item.content).join("\n");
+      const category = refundCategory(customerText);
+      return this.escalateToHuman(phone, response.text || "AI requested human support", category, extractOrderNumber(customerText), response.text);
+    }
     if (!response.text) throw new Error("AI returned neither a reply nor a tool call");
     if (!response.resolved && turnCount >= Math.max(1, this.dependencies.aiMaxTurns || 3)) return this.escalateToHuman(phone, "The AI agent could not resolve the conversation within the configured turn limit", "other");
     if (response.resolved) await this.dependencies.store.clearConversation(phone);
     await this.send(phone, response.text, undefined, undefined, response.provider);
   }
 
-  private async executeAiTool(phone: string, toolCall: AiToolCall) {
+  private async executeAiTool(phone: string, toolCall: AiToolCall, customerMessage?: string) {
     const args = toolCall.arguments;
-    const rawIdentifier = String(args.identifier || args.order_number || args.phone || phone);
+    const rawIdentifier = String(args.identifier || args.order_number || args.order_id || args.orderId || args.phone || phone);
     const identifier = extractOrderNumber(rawIdentifier) || extractPhoneNumber(rawIdentifier) || rawIdentifier;
     if (toolCall.name === "lookup_order") return this.resolveIdentifier(phone, "confirm_order", identifier);
     if (toolCall.name === "track_order") return this.resolveIdentifier(phone, "order_status", identifier);
@@ -122,8 +128,11 @@ export class WhatsAppRouter {
       return this.resolveIdentifier(phone, intent, String(args.phone || phone));
     }
     if (toolCall.name === "create_ticket") {
-      const category = isTicketCategory(args.category) ? args.category : "other";
-      return this.escalateToHuman(phone, String(args.reason || "Customer requested human support"), category, typeof args.order_number === "string" ? args.order_number : undefined);
+      const reason = String(args.reason || customerMessage || "Customer requested human support");
+      const inferredCategory = refundCategory(`${String(args.category || "")} ${reason} ${customerMessage || ""}`);
+      const category = isTicketCategory(args.category) && args.category !== "other" ? args.category : inferredCategory;
+      const rawOrderNumber = String(args.order_number || args.order_id || args.orderId || "");
+      return this.escalateToHuman(phone, reason, category, extractOrderNumber(rawOrderNumber), customerMessage);
     }
     throw new Error(`Unsupported AI tool: ${toolCall.name}`);
   }
@@ -135,13 +144,29 @@ export class WhatsAppRouter {
     catch (error) { console.error(`[support] Could not load brain file at ${filePath}; using built-in rules`, error); return DEFAULT_BRAIN; }
   }
 
-  private async escalateToHuman(phone: string, reason: string, category: SupportTicket["category"], orderNumber?: string) {
+  private async loadSupportPolicy() {
+    const brain = await this.loadBrain();
+    const heading = /^##\s+Refund, return, exchange, and missing-item policy\s*$/im;
+    const start = heading.exec(brain);
+    if (!start) return DEFAULT_POLICY_GUIDANCE;
+    const remainder = brain.slice(start.index + start[0].length);
+    const content = remainder.split(/\n##\s+/)[0]
+      .replace(/<!--[\s\S]*?-->/g, "")
+      .replace(/^\s*[-*]\s+/gm, "• ")
+      .trim();
+    return content || DEFAULT_POLICY_GUIDANCE;
+  }
+
+  private async escalateToHuman(phone: string, reason: string, category: SupportTicket["category"], orderNumber?: string, customerMessage?: string) {
     const ticket: SupportTicket = { ticketId: crypto.randomUUID(), phone, ...(orderNumber ? { orderNumber } : {}), category, description: reason.slice(0, 2_000), status: "open", createdAt: new Date().toISOString() };
     await this.dependencies.store.createSupportTicket(ticket);
     await this.dependencies.store.clearConversation(phone);
     const escalationPhone = String(this.dependencies.escalationPhone || this.dependencies.supportPhone || "").replace(/\D/g, "");
     if (escalationPhone && escalationPhone !== phone) await this.dependencies.whatsapp.sendText(escalationPhone, `🚨 Customer ${phone} needs human help.${orderNumber ? `\nOrder: ${orderNumber}` : ""}\nReason: ${reason}\nTicket: ${ticket.ticketId.slice(0, 8)}`).catch((error) => console.error(`[support:${phone}] escalation notification failed`, error));
-    await this.send(phone, `I've connected you with our support team. Ticket ${ticket.ticketId.slice(0, 8)} has been created, and someone will follow up shortly. 🙏`, "refund_return", orderNumber);
+    const policy = category === "other" ? "" : await this.loadSupportPolicy();
+    const guidance = customerMessage?.trim() || policy;
+    const acknowledgement = `Your request has been forwarded to our senior support team. Ticket ${ticket.ticketId.slice(0, 8)} has been created. Please wait for their WhatsApp update—we will review it and help you as soon as possible. 🙏`;
+    await this.send(phone, [guidance, acknowledgement].filter(Boolean).join("\n\n"), "refund_return", orderNumber);
   }
 
   private async resume(conversation: SupportConversation, text: string) {
@@ -166,9 +191,11 @@ export class WhatsAppRouter {
     }
     if (step === "waiting_pick" && intent) {
       const options = Array.isArray(context.orders) ? context.orders as Array<{ name: string; source?: "shopify" | "nimbus" }> : [];
-      const selected = options[Number(text.trim()) - 1];
-      if (!selected) return this.send(phone, `Reply with a number from 1 to ${options.length}.`, intent);
-      return this.dispatch(phone, intent, selected.name, { ...context, phoneLookupVerified: true });
+      const selectedByPosition = options[Number(text.trim()) - 1];
+      const selectedSuffix = extractOrderSuffix(text);
+      const selected = selectedByPosition || options.find((option) => selectedSuffix && extractOrderSuffix(option.name) === selectedSuffix);
+      if (!selected) return this.send(phone, `Reply with a number from 1 to ${options.length}, or send one of the order IDs shown above.`, intent);
+      return this.dispatch(phone, intent, selected.name, context);
     }
     if (step === "waiting_address" && intent === "change_address") {
       const parsed = parseAddress(text);
@@ -208,17 +235,16 @@ export class WhatsAppRouter {
 
   private async askRefundIssue(phone: string) {
     await this.save({ phone, intent: "refund_return", step: "waiting_issue", context: {} });
-    await this.send(phone, "What do you need help with?\n1️⃣ Refund\n2️⃣ Return or wrong item\n3️⃣ Missing item", "refund_return");
+    await this.send(phone, "What do you need help with?\n1️⃣ Refund\n2️⃣ Return, exchange, or wrong item\n3️⃣ Missing item", "refund_return");
   }
 
   private async resolveIdentifier(phone: string, intent: SupportIntent, identifier: string, context: Record<string, unknown> = {}) {
-    if (identifier.startsWith("#RBD")) return this.dispatch(phone, intent, identifier, context);
-    if (normalizePhoneNumber(identifier) !== normalizePhoneNumber(phone)) {
-      await this.dependencies.store.clearConversation(phone);
-      return this.send(phone, `For your security, order lookup must use the phone number connected to this WhatsApp chat. Please message us from the order phone or contact ${this.dependencies.supportPhone || "support"}.`);
-    }
-    const shopifyOrders = await this.dependencies.shopify.getOrdersByPhone(identifier).catch((error) => { console.error(`[support:${phone}] Shopify phone lookup failed`, error); return []; });
-    const nimbusOrders = shopifyOrders.length ? [] : await this.dependencies.nimbus.getOrdersByPhone(identifier).catch((error) => { console.error(`[support:${phone}] Nimbus phone lookup failed`, error); return []; });
+    const orderNumber = extractOrderNumber(identifier);
+    if (orderNumber) return this.dispatch(phone, intent, orderNumber, context);
+    const customerPhone = normalizePhoneNumber(identifier);
+    if (!customerPhone) return this.askForOrder(phone, intent, context);
+    const shopifyOrders = await this.dependencies.shopify.getOrdersByPhone(customerPhone).catch((error) => { console.error(`[support:${phone}] Shopify phone lookup failed`, error); return []; });
+    const nimbusOrders = shopifyOrders.length ? [] : await this.dependencies.nimbus.getOrdersByPhone(customerPhone).catch((error) => { console.error(`[support:${phone}] Nimbus phone lookup failed`, error); return []; });
     const orders = [
       ...shopifyOrders.map((order) => ({ name: order.name, source: "shopify" as const, summary: formatShopifyOrderSummary(order) })),
       ...nimbusOrders.map((order) => ({ name: order.order_number, source: "nimbus" as const, summary: `${order.items?.map((item) => `${item.name || "Item"} ×${item.qty || 1}`).join(", ") || "Order"}${order.order_status ? ` · ${humanStatus(order.order_status)}` : ""}` })),
@@ -227,7 +253,7 @@ export class WhatsAppRouter {
       await this.save({ phone, intent, step: "waiting_order", context: { ...context, retries: 1 } });
       return this.send(phone, "We couldn't find an order for that phone number. Check the number or send your RBD order number.", intent);
     }
-    if (orders.length === 1) return this.dispatch(phone, intent, orders[0].name, { ...context, phoneLookupVerified: true });
+    if (orders.length === 1) return this.dispatch(phone, intent, orders[0].name, context);
     await this.save({ phone, intent, step: "waiting_pick", context: { ...context, orders: orders.map((order) => ({ name: order.name, source: order.source })) } });
     await this.sendOrderChoices(phone, intent, orders);
   }
@@ -237,21 +263,17 @@ export class WhatsAppRouter {
       const shopifyOrder = await this.dependencies.shopify.getOrderByName(orderNumber).catch((error) => { console.error(`[support:${phone}] Shopify order lookup failed`, error); return null; });
       const nimbusOrder = shopifyOrder ? null : await this.dependencies.nimbus.lookupOrder(orderNumber).catch((error) => { console.error(`[support:${phone}] Nimbus order lookup failed`, error); return null; });
       if (!shopifyOrder && !nimbusOrder) throw new Error(`Order ${orderNumber} was not found in Shopify or NimbusPost`);
-      const belongsToSender = context.phoneLookupVerified === true || (shopifyOrder ? this.orderBelongsToSender(shopifyOrder, phone) : this.nimbusOrderBelongsToSender(nimbusOrder!, phone));
-      if (!belongsToSender) {
-        await this.dependencies.store.clearConversation(phone);
-        return await this.send(phone, `We couldn't verify that order against this WhatsApp number. Please message us from the phone used on the order or contact ${this.dependencies.supportPhone || "support"}.`);
-      }
+      const resolvedOrderNumber = shopifyOrder?.name || nimbusOrder?.order_number || orderNumber;
       if (intent === "confirm_order") return shopifyOrder ? await this.confirmOrder(phone, shopifyOrder) : await this.confirmNimbusOrder(phone, nimbusOrder!);
-      if (intent === "order_status") return await this.orderStatus(phone, orderNumber, shopifyOrder || undefined, nimbusOrder || undefined);
-      if (intent === "not_dispatched") return await this.notDispatched(phone, orderNumber, shopifyOrder || undefined, nimbusOrder || undefined);
+      if (intent === "order_status") return await this.orderStatus(phone, resolvedOrderNumber, shopifyOrder || undefined, nimbusOrder || undefined);
+      if (intent === "not_dispatched") return await this.notDispatched(phone, resolvedOrderNumber, shopifyOrder || undefined, nimbusOrder || undefined);
       if (intent === "refund_return") return shopifyOrder ? await this.refundReturn(phone, shopifyOrder, context.ticketCategory as SupportTicket["category"] | undefined) : await this.refundNimbusOrder(phone, nimbusOrder!, context.ticketCategory as SupportTicket["category"] | undefined);
       if (intent === "change_address") {
         if (shopifyOrder) return await this.beginAddressChange(phone, shopifyOrder);
         await this.dependencies.store.clearConversation(phone);
         return await this.send(phone, `We found ${nimbusOrder!.order_number}, but it is not linked to the configured Shopify store, so the bot cannot safely change its address. Please contact ${this.dependencies.supportPhone || "support"}.`, intent, nimbusOrder!.order_number);
       }
-      return await this.orderFailed(phone, orderNumber, nimbusOrder || undefined);
+      return await this.orderFailed(phone, resolvedOrderNumber, nimbusOrder || undefined);
     } catch (error) {
       console.error(`[support:${phone}] ${intent} failed`, error);
       await this.save({ phone, intent, step: "waiting_order", context: { retries: 0 } });
@@ -307,17 +329,12 @@ export class WhatsAppRouter {
   }
 
   private async refundReturn(phone: string, order: ShopifyOrder, category: SupportTicket["category"] = "other") {
-    const ticket: SupportTicket = { ticketId: crypto.randomUUID(), phone, orderNumber: order.name, category, description: "Refund, return, missing, or wrong-item request received on WhatsApp", status: "open", createdAt: new Date().toISOString() };
-    await this.dependencies.store.createSupportTicket(ticket);
-    await this.dependencies.store.clearConversation(phone);
-    await this.send(phone, `We found ${order.name} (${order.lineItems.map((item) => `${item.title} ×${item.quantity}`).join(", ")}, ${formatMoney(order)}).\n\nFor refund, return, or missing-item help, please WhatsApp/call ${this.dependencies.supportPhone || "our support team"} and mention order ${order.name}. Ticket ${ticket.ticketId.slice(0, 8)} has been logged. 🙏`, "refund_return", order.name);
+    const details = `We found ${order.name}: ${order.lineItems.map((item) => `${item.title} ×${item.quantity}`).join(", ")} · ${formatMoney(order)}.`;
+    await this.escalateToHuman(phone, `Refund, return, exchange, missing, or wrong-item request received on WhatsApp. ${details}`, category, order.name);
   }
 
   private async refundNimbusOrder(phone: string, order: OrderMatch, category: SupportTicket["category"] = "other") {
-    const ticket: SupportTicket = { ticketId: crypto.randomUUID(), phone, orderNumber: order.order_number, category, description: "Refund, return, missing, or wrong-item request received on WhatsApp for a NimbusPost order", status: "open", createdAt: new Date().toISOString() };
-    await this.dependencies.store.createSupportTicket(ticket);
-    await this.dependencies.store.clearConversation(phone);
-    await this.send(phone, `We found ${order.order_number}. Ticket ${ticket.ticketId.slice(0, 8)} has been logged. Please WhatsApp/call ${this.dependencies.supportPhone || "our support team"} and mention the order number for refund or return help. 🙏`, "refund_return", order.order_number);
+    await this.escalateToHuman(phone, "Refund, return, exchange, missing, or wrong-item request received on WhatsApp for a NimbusPost order", category, order.order_number);
   }
 
   private async beginAddressChange(phone: string, shopifyOrder: ShopifyOrder) {
@@ -387,7 +404,6 @@ export class WhatsAppRouter {
     if (text.trim() === "3" && availableActions.includes("rto")) { await this.dependencies.nimbus.submitNdrAction(awb, { action: "rto" }); await this.dependencies.store.clearConversation(phone); return this.send(phone, `↩️ Return to sender has been requested. Contact ${this.dependencies.supportPhone || "support"} for refund questions.`, "order_failed", orderNumber); }
     if (text.trim() === "2" && availableActions.includes("reattempt")) {
       const order = await this.requireShopifyOrder(orderNumber);
-      if (!this.orderBelongsToSender(order, phone)) { await this.dependencies.store.clearConversation(phone); return this.send(phone, `We couldn't verify that order against this WhatsApp number. Please contact ${this.dependencies.supportPhone || "support"}.`); }
       return this.askForAddress(phone, order, { branch: "ndr", awb });
     }
     await this.send(phone, "That action is not currently available from the courier. Choose one of the options shown above.", "order_failed", orderNumber);
@@ -399,24 +415,6 @@ export class WhatsAppRouter {
     return order;
   }
 
-  private orderBelongsToSender(order: ShopifyOrder, phone: string) {
-    const sender = normalizePhoneNumber(phone);
-    const candidates = order.customerPhones?.length ? order.customerPhones : [order.shippingAddress?.phone].filter((candidate): candidate is string => Boolean(candidate));
-    return Boolean(sender && candidates.some((candidate) => normalizePhoneNumber(candidate) === sender));
-  }
-
-  private nimbusOrderBelongsToSender(order: OrderMatch, phone: string) {
-    const sender = normalizePhoneNumber(phone);
-    const candidates = [order.shipping_address?.phone, order.billing_address?.phone].filter((candidate) => candidate !== undefined);
-    return Boolean(sender && candidates.some((candidate) => {
-      const value = String(candidate);
-      const normalized = normalizePhoneNumber(value);
-      if (normalized) return normalized === sender;
-      const visibleDigits = value.replace(/\D/g, "");
-      return /[x*]/i.test(value) && visibleDigits.length >= 2 && sender.endsWith(visibleDigits);
-    }));
-  }
-
   private async sendOrderChoices(phone: string, intent: SupportIntent, orders: Array<{ name: string; source?: "shopify" | "nimbus"; summary: string }>) {
     const lines = orders.map((order, index) => `${index + 1}. ${order.name} — ${order.summary}`);
     const chunks: string[] = [];
@@ -425,7 +423,7 @@ export class WhatsAppRouter {
       if (`${chunk}\n${line}`.length > 3_500) { chunks.push(chunk); chunk = line; }
       else chunk += `\n${line}`;
     }
-    chunks.push(`${chunk}\n\nReply with the order number from this list.`);
+    chunks.push(`${chunk}\n\nReply with the list number or any order ID above for live tracking or another action.`);
     for (const message of chunks) await this.send(phone, message, intent);
   }
 
@@ -446,20 +444,29 @@ function parseAddress(text: string): ShopifyAddress | null {
   const address1 = parts.join(", ");
   return address1.length >= 5 && city.length >= 2 && province.length >= 2 && /^\d{6}$/.test(zip) ? { address1, city, province, zip, country: "India" } : null;
 }
-const refundCategory = (text: string): SupportTicket["category"] => /missing|nahi aaya|rakhi nahi/i.test(text) ? "missing" : /refund|paisa wapas/i.test(text) ? "refund" : /return|wrong item|galat item/i.test(text) ? "return" : "other";
+const refundCategory = (text: string): SupportTicket["category"] => /missing|nahi aaya|rakhi nahi/i.test(text) ? "missing" : /refund|paisa wapas/i.test(text) ? "refund" : /return|exchange|replace(?:ment)?|wrong item|galat item|badalna/i.test(text) ? "return" : "other";
 const formatAddress = (address: ShopifyAddress) => [address.address1, address.address2, address.city, address.province, address.zip].filter(Boolean).join(", ");
 const formatMoney = (order: ShopifyOrder) => new Intl.NumberFormat("en-IN", { style: "currency", currency: order.currencyCode }).format(Number(order.totalAmount));
 const formatShopifyOrderSummary = (order: ShopifyOrder) => {
-  const items = order.lineItems.slice(0, 3).map((item) => `${item.title} ×${item.quantity}`).join(", ") || "Order items unavailable";
-  const extraItems = order.lineItems.length > 3 ? ` +${order.lineItems.length - 3} more` : "";
+  const items = order.lineItems.map((item) => `${item.title} ×${item.quantity}`).join(", ") || "Order items unavailable";
   const date = new Date(order.createdAt).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
   const statuses = [order.displayFinancialStatus, order.displayFulfillmentStatus].filter(Boolean).map((status) => humanStatus(String(status))).join(" / ");
   const tracking = order.trackingInfo?.find((item) => item.number || item.url);
-  return `${date} · ${items}${extraItems} · ${formatMoney(order)}${statuses ? ` · ${statuses}` : ""}${tracking?.number ? ` · AWB ${tracking.number}` : ""}`;
+  const address = order.shippingAddress ? formatAddress(order.shippingAddress) : "Address unavailable";
+  return `${date}\n   📦 ${items}\n   💰 ${formatMoney(order)}${statuses ? ` · ${statuses}` : ""}\n   📍 ${address}${tracking?.number ? `\n   🚚 AWB ${tracking.number}${tracking.company ? ` · ${tracking.company}` : ""}` : ""}`;
+};
+const inferIntent = (messages: ChatMessage[]): SupportIntent | undefined => {
+  for (const message of [...messages].reverse()) {
+    if (message.role !== "user") continue;
+    const intent = classifyIntent(message.content);
+    if (intent) return intent;
+  }
+  return undefined;
 };
 const isSupportIntent = (value: unknown): value is SupportIntent => typeof value === "string" && ["confirm_order", "change_address", "order_status", "not_dispatched", "order_failed", "refund_return"].includes(value);
 const isTicketCategory = (value: unknown): value is SupportTicket["category"] => typeof value === "string" && ["refund", "return", "missing", "other"].includes(value);
 const DEFAULT_BRAIN = "You are AutoShip support. Return JSON with text, toolCalls, resolved, and escalate. Never invent order facts; use a tool for every order question.";
+const DEFAULT_POLICY_GUIDANCE = "Our team will review your refund, return, exchange, or missing-item request according to the store policy. Please keep the item and packaging safe until our senior support team confirms the next step.";
 const formatDate = (value: string) => new Date(value).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" });
 const statusEmoji = (status: string) => /delivered/i.test(status) ? "✅" : /out for delivery/i.test(status) ? "🎉" : /ndr|fail/i.test(status) ? "⚠️" : /rto|return/i.test(status) ? "↩️" : "🚚";
 const humanStatus = (status: string) => status.replace(/\b\w/g, (letter) => letter.toUpperCase());

@@ -1,5 +1,5 @@
 import type { ShopifyAddress, ShopifyOrder } from "./types.js";
-import { normalizeOrderNumber, normalizePhoneNumber } from "./identifiers.js";
+import { extractOrderSuffix, normalizeOrderNumber, normalizePhoneNumber } from "./identifiers.js";
 
 type ShopifyConfig = {
   storeDomain: string;
@@ -119,8 +119,17 @@ export class ShopifyClient {
     const normalized = this.normalizeShopifyOrderName(name);
     if (!normalized) return null;
     if (this.config.mockMode) return this.mockOrder(normalized);
-    const orders = await this.findOrders(`name:${this.escapeSearch(normalized)}`, 5);
-    return orders.find((order) => this.normalizeShopifyOrderName(order.name) === normalized) || null;
+    const exactOrders = await this.findOrders(`name:${this.escapeSearch(normalized)}`, 5);
+    const exact = exactOrders.find((order) => this.normalizeShopifyOrderName(order.name) === normalized);
+    if (exact) return exact;
+
+    // Some storefronts expose an RBD reference to customers while Shopify's
+    // configured order name uses another prefix (for example #DR3053). Shopify
+    // can search the numeric name suffix, so match it exactly as a safe alias.
+    const suffix = extractOrderSuffix(name) || extractOrderSuffix(normalized);
+    if (!suffix) return null;
+    const suffixOrders = await this.findOrders(`name:${suffix}`, 25);
+    return suffixOrders.find((order) => extractOrderSuffix(order.name) === suffix) || null;
   }
 
   async getOrdersByPhone(phone: string) {

@@ -36,6 +36,17 @@ describe("ShopifyClient", () => {
     await expect(makeClient().getOrdersByPhone("0091 98765 43210")).resolves.toMatchObject([{ name: "#RBD5001" }]);
   });
 
+  it("resolves bare and RBD references when Shopify uses a different order prefix", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/admin/oauth/access_token")) return json({ access_token: "access-token", expires_in: 3600 });
+      const body = JSON.parse(String(init?.body)) as { variables: { query: string } };
+      const nodes = body.variables.query === "name:5001" ? [{ id: "gid://shopify/Order/5001", name: "#DR5001", createdAt: "2026-08-15T10:00:00Z", currentTotalPriceSet: { shopMoney: { amount: "499.00", currencyCode: "INR" } }, lineItems: { nodes: [] }, fulfillments: [] }] : [];
+      return json({ data: { orders: { nodes } } });
+    }));
+
+    await expect(makeClient().getOrderByName("#RBD5001")).resolves.toMatchObject({ name: "#DR5001" });
+  });
+
   it("returns every order belonging to the matched customer even when an old order has a different delivery phone", async () => {
     vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
       if (String(input).endsWith("/admin/oauth/access_token")) return json({ access_token: "access-token", expires_in: 3600 });

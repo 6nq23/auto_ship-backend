@@ -45,10 +45,10 @@ describe("WhatsApp support parsing", () => {
     expect(refundCategory("wrong item return karna hai")).toBe("return");
   });
 
-  it("does not reveal an order when the WhatsApp sender phone does not match", async () => {
+  it("returns an order without requiring the WhatsApp sender phone to match", async () => {
     const sendText = vi.fn(async () => undefined);
     const clearConversation = vi.fn(async () => undefined);
-    const nimbusLookup = vi.fn();
+    const nimbusLookup = vi.fn(async () => null);
     const router = new WhatsAppRouter({
       store: {
         addWhatsAppMessage: vi.fn(async () => true),
@@ -74,10 +74,10 @@ describe("WhatsApp support parsing", () => {
 
     await router.handleIncomingMessage({ id: "wa-unauthorized-1", phone: "911111111111", text: "track RBD5001" });
 
-    expect(nimbusLookup).not.toHaveBeenCalled();
+    expect(nimbusLookup).toHaveBeenCalledWith("#RBD5001");
     expect(clearConversation).toHaveBeenCalledWith("911111111111");
-    expect(sendText.mock.calls[0]?.[1]).toContain("couldn't verify");
-    expect(sendText.mock.calls[0]?.[1]).not.toContain("#RBD5001");
+    expect(sendText.mock.calls[0]?.[1]).toContain("#RBD5001");
+    expect(sendText.mock.calls[0]?.[1]).not.toContain("couldn't verify");
   });
 
   it("does not offer NDR actions when Nimbus explicitly returns none", async () => {
@@ -149,6 +149,30 @@ describe("WhatsApp support parsing", () => {
     expect(sendText).toHaveBeenCalledTimes(1);
     expect(sendText.mock.calls[0]?.[1]).toContain("AWB-9588");
     expect(sendText.mock.calls[0]?.[1]).not.toContain("PIN code");
+  });
+
+  it("returns every Shopify order for a normalized phone lookup", async () => {
+    const sendText = vi.fn(async () => undefined);
+    const saveConversation = vi.fn(async () => undefined);
+    const getOrdersByPhone = vi.fn(async () => [
+      { id: "gid://shopify/Order/1", name: "#DR5002", createdAt: "2026-08-16T10:00:00Z", totalAmount: "799", currencyCode: "INR", displayFinancialStatus: "PAID", displayFulfillmentStatus: "UNFULFILLED", shippingAddress: { address1: "12 MG Road", city: "Bengaluru", province: "Karnataka", zip: "560001" }, lineItems: [{ title: "Premium Rakhi", quantity: 1 }] },
+      { id: "gid://shopify/Order/2", name: "#DR5001", createdAt: "2026-08-15T10:00:00Z", totalAmount: "499", currencyCode: "INR", displayFinancialStatus: "PAID", displayFulfillmentStatus: "FULFILLED", shippingAddress: { address1: "12 MG Road", city: "Bengaluru", province: "Karnataka", zip: "560001" }, lineItems: [{ title: "Rakhi Set", quantity: 2 }] },
+    ]);
+    const router = new WhatsAppRouter({
+      store: { addWhatsAppMessage: vi.fn(async () => true), getConversation: vi.fn(async () => undefined), saveConversation, withConversationLock: async (_phone: string, task: () => Promise<unknown>) => task() } as unknown as Store,
+      shopify: { getOrdersByPhone } as unknown as ShopifyClient,
+      nimbus: { getOrdersByPhone: vi.fn(async () => []) } as unknown as NimbusClient,
+      whatsapp: { sendText } as unknown as WhatsAppClient,
+      supportPhone: "919999999999",
+    });
+
+    await router.handleIncomingMessage({ id: "wa-phone-orders", phone: "911111111111", text: "track orders for +91 98765 43210" });
+    expect(getOrdersByPhone).toHaveBeenCalledWith("9876543210");
+    expect(sendText.mock.calls[0]?.[1]).toContain("#DR5002");
+    expect(sendText.mock.calls[0]?.[1]).toContain("#DR5001");
+    expect(sendText.mock.calls[0]?.[1]).toContain("Premium Rakhi");
+    expect(sendText.mock.calls[0]?.[1]).toContain("12 MG Road");
+    expect(saveConversation).toHaveBeenCalledWith(expect.objectContaining({ step: "waiting_pick" }));
   });
 
   it("uses an AI tool call to route natural language into the existing tracking handler", async () => {
@@ -230,5 +254,30 @@ describe("WhatsApp support parsing", () => {
     expect(createSupportTicket).toHaveBeenCalledWith(expect.objectContaining({ phone: "919876543210", category: "other", status: "open" }));
     expect(sendText.mock.calls[0]?.[0]).toBe("919924863749");
     expect(sendText.mock.calls[1]?.[0]).toBe("919876543210");
+  });
+
+  it("reads policy guidance from brain.md and escalates exchange requests", async () => {
+    const sendText = vi.fn(async () => undefined);
+    const createSupportTicket = vi.fn(async () => undefined);
+    const ai = new AiOrchestrator([{ name: "gemini", chat: vi.fn(async () => ({ text: "", toolCalls: [{ name: "create_ticket", arguments: { reason: "Customer received the wrong item and wants an exchange", order_number: "RBD5001", category: "exchange" } }] })) }]);
+    const router = new WhatsAppRouter({
+      store: {
+        addWhatsAppMessage: vi.fn(async () => true), getConversation: vi.fn(async () => undefined), getConversationHistory: vi.fn(async () => []), incrementAiTurnCount: vi.fn(async () => 1), clearConversation: vi.fn(async () => undefined), createSupportTicket,
+        withConversationLock: async (_phone: string, task: () => Promise<unknown>) => task(),
+      } as unknown as Store,
+      shopify: {} as ShopifyClient,
+      nimbus: {} as NimbusClient,
+      whatsapp: { sendText } as unknown as WhatsAppClient,
+      supportPhone: "919999999999",
+      escalationPhone: "919924863749",
+      brainFilePath: "data/brain.md",
+      ai,
+    });
+
+    await router.handleIncomingMessage({ id: "wa-ai-exchange", phone: "919876543210", text: "I received the wrong rakhi and want an exchange" });
+    expect(createSupportTicket).toHaveBeenCalledWith(expect.objectContaining({ category: "return", orderNumber: "#RBD5001" }));
+    expect(sendText.mock.calls[0]?.[0]).toBe("919924863749");
+    expect(sendText.mock.calls[1]?.[1]).toContain("keep the item");
+    expect(sendText.mock.calls[1]?.[1]).toContain("senior support team");
   });
 });
