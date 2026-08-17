@@ -2,6 +2,13 @@ import bcrypt from "bcryptjs";
 import { getPrisma } from "./db.js";
 const asJson = (value) => value;
 const isUniqueConstraintError = (error) => Boolean(error && typeof error === "object" && "code" in error && error.code === "P2002");
+const retryRead = async (operation) => { try {
+    return await operation();
+}
+catch {
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    return operation();
+} };
 export class PrismaStore {
     demoMode;
     initialPassword;
@@ -171,6 +178,9 @@ export class PrismaStore {
                 updatedAt: new Date(job.updatedAt),
                 status: job.status,
                 activeOwnerKey: job.status === "queued" || job.status === "processing" ? job.createdBy.toLowerCase() : null,
+                // A queued job is between durable chunks and must be claimable by the
+                // next polling/serverless invocation. Terminal jobs no longer need a lease.
+                leaseUntil: job.status === "processing" ? undefined : null,
                 payload: asJson(job),
             },
         });
@@ -190,11 +200,11 @@ export class PrismaStore {
         return this.getShippingJob(jobId);
     }
     async getShippingJob(jobId) {
-        const row = await this.prisma.shippingJob.findUnique({ where: { jobId }, select: { payload: true } });
+        const row = await retryRead(() => this.prisma.shippingJob.findUnique({ where: { jobId }, select: { payload: true } }));
         return row?.payload;
     }
     async getActiveShippingJob(username) {
-        const row = await this.prisma.shippingJob.findUnique({ where: { activeOwnerKey: username.toLowerCase() }, select: { payload: true } });
+        const row = await retryRead(() => this.prisma.shippingJob.findUnique({ where: { activeOwnerKey: username.toLowerCase() }, select: { payload: true } }));
         return row?.payload;
     }
     async getPendingShippingJobs() {

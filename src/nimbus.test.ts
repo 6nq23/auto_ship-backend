@@ -95,6 +95,23 @@ describe("Nimbus courier priority", () => {
     expect(result.pickupScheduledLabelUrl).toBe("https://labels.test/77.pdf");
   });
 
+  it("recovers pickup_pending as successful and includes it in the separate pickup labels", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v2/orders" && url.search) return json({ success: true, data: [{ order_id: "ORD-78", order_number: "#RBD4078", order_status: "created" }] });
+      if (url.pathname === "/v2/shipments/book") return json({ error: { code: "VALIDATION_FAILED", detail: 'Order cannot be booked - current status is "pickup_pending". Only orders in "created" status can be booked.' } }, 400);
+      if (url.pathname === "/v2/orders/ORD-78") return json({ success: true, data: { order_id: "ORD-78", order_number: "#RBD4078", order_status: "pickup_pending", shipment: { awb: "AWB-78", courier_name: "Bluedart Brand", amount: 88 } } });
+      if (url.pathname === "/v2/shipments/labels") return json({ success: true, data: { url: "https://labels.test/78.pdf" } });
+      throw new Error(`Unexpected request: ${url}`);
+    }));
+
+    const result = await makeClient().shipMany(["#RBD4078"], 1);
+    expect(result.failed).toEqual([]);
+    expect(result.shipped).toEqual([expect.objectContaining({ orderNumber: "#RBD4078", warningCode: "PICKUP_ALREADY_PENDING", alreadyBooked: true })]);
+    expect(result.labelUrl).toBe("https://labels.test/78.pdf");
+    expect(result.pickupScheduledLabelUrl).toBe("https://labels.test/78.pdf");
+  });
+
   it("processes a bulk batch with at most five orders concurrently", async () => {
     let activeBookings = 0; let maximumActiveBookings = 0; let labelIds: string[] = [];
     vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {

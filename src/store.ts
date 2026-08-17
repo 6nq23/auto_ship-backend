@@ -35,6 +35,7 @@ export interface Store {
 
 const asJson = (value: Batch | ShippingJob) => value as unknown as Prisma.InputJsonValue;
 const isUniqueConstraintError = (error: unknown) => Boolean(error && typeof error === "object" && "code" in error && error.code === "P2002");
+const retryRead = async <T>(operation: () => Promise<T>) => { try { return await operation(); } catch { await new Promise((resolve) => setTimeout(resolve, 150)); return operation(); } };
 
 export class PrismaStore implements Store {
   private readonly prisma: PrismaClient;
@@ -231,12 +232,12 @@ export class PrismaStore implements Store {
   }
 
   async getShippingJob(jobId: string) {
-    const row = await this.prisma.shippingJob.findUnique({ where: { jobId }, select: { payload: true } });
+    const row = await retryRead(() => this.prisma.shippingJob.findUnique({ where: { jobId }, select: { payload: true } }));
     return row?.payload as unknown as ShippingJob | undefined;
   }
 
   async getActiveShippingJob(username: string) {
-    const row = await this.prisma.shippingJob.findUnique({ where: { activeOwnerKey: username.toLowerCase() }, select: { payload: true } });
+    const row = await retryRead(() => this.prisma.shippingJob.findUnique({ where: { activeOwnerKey: username.toLowerCase() }, select: { payload: true } }));
     return row?.payload as unknown as ShippingJob | undefined;
   }
 

@@ -1,4 +1,6 @@
 import { normalizeOrderNumber, normalizePhoneNumber } from "./identifiers.js";
+const isPickupRecoveryStatus = (status) => ["pickup_scheduled", "pickup_pending"].includes(status?.toLowerCase() || "");
+const isPickupRecoveryWarning = (item) => ["PICKUP_ALREADY_SCHEDULED", "PICKUP_ALREADY_PENDING"].includes(item.warningCode || "");
 export const COURIER_PRIORITY = [
     { roleId: "6a61a64916956018f71a27d3", courierId: "6a0d96ef27ad772d357b22cc", name: "Delhivery Surface DT" },
     { roleId: "6a61a64916956018f71a27d7", courierId: "6a06d0daea73ccc9fd278986", name: "Bluedart Brand" },
@@ -15,7 +17,7 @@ export class NimbusClient {
         this.config = config;
         this.cache = cache;
     }
-    async shipMany(orderNumbers, concurrency = 5, onProgress) {
+    async shipMany(orderNumbers, concurrency = 5, onProgress, generateLabels = true) {
         const shipped = [];
         const failed = [];
         let cursor = 0;
@@ -46,7 +48,7 @@ export class NimbusClient {
         failed.sort((a, b) => orderNumbers.indexOf(a.orderNumber) - orderNumbers.indexOf(b.orderNumber));
         let labelUrl = null;
         let pickupScheduledLabelUrl = null;
-        if (shipped.length) {
+        if (generateLabels && shipped.length) {
             await onProgress?.({ type: "labels_started", count: shipped.length });
             try {
                 labelUrl = await this.labels(shipped.map((item) => item.orderId));
@@ -57,8 +59,8 @@ export class NimbusClient {
                 await onProgress?.({ type: "labels_failed", error: parsed.error });
             }
         }
-        const pickupScheduled = shipped.filter((item) => item.warningCode === "PICKUP_ALREADY_SCHEDULED");
-        if (pickupScheduled.length) {
+        const pickupScheduled = shipped.filter(isPickupRecoveryWarning);
+        if (generateLabels && pickupScheduled.length) {
             await onProgress?.({ type: "pickup_labels_started", count: pickupScheduled.length });
             try {
                 pickupScheduledLabelUrl = await this.labels(pickupScheduled.map((item) => item.orderId));
@@ -193,8 +195,8 @@ export class NimbusClient {
             throw new AppError("ORDER_CANCELLED", "Order was cancelled");
         if (order.order_status === "booked" && order.shipment?.awb)
             return { orderNumber, orderId: order.order_id, awb: order.shipment.awb, courier: order.shipment.courier_name || "Allocated courier", cost: order.shipment.price?.total ?? order.shipment.amount ?? 0, alreadyBooked: true };
-        if (order.order_status?.toLowerCase() === "pickup_scheduled")
-            return this.pickupScheduledShipment(orderNumber, order);
+        if (isPickupRecoveryStatus(order.order_status))
+            return this.pickupRecoveryShipment(orderNumber, order);
         const rejected = [];
         for (let index = 0; index < COURIER_PRIORITY.length; index++) {
             const courier = COURIER_PRIORITY[index];
@@ -214,14 +216,15 @@ export class NimbusClient {
             }
         }
         const exhaustedError = `All ${COURIER_PRIORITY.length} priority couriers rejected this shipment. ${rejected.at(-1) || "No courier was serviceable."}`;
-        if (rejected.some((message) => /current status is\s*["']?pickup_scheduled/i.test(message))) {
+        if (rejected.some((message) => /current status is\s*["']?pickup_(?:scheduled|pending)/i.test(message))) {
             const refreshed = await this.getOrder(order.order_id, signal);
-            if (refreshed.order_status?.toLowerCase() === "pickup_scheduled")
-                return this.pickupScheduledShipment(orderNumber, refreshed, exhaustedError);
+            if (isPickupRecoveryStatus(refreshed.order_status))
+                return this.pickupRecoveryShipment(orderNumber, refreshed, exhaustedError);
         }
         throw new AppError("COURIER_PRIORITY_EXHAUSTED", exhaustedError);
     }
-    pickupScheduledShipment(orderNumber, order, warning) {
+    pickupRecoveryShipment(orderNumber, order, warning) {
+        const pending = order.order_status?.toLowerCase() === "pickup_pending";
         return {
             orderNumber,
             orderId: order.order_id,
@@ -229,8 +232,8 @@ export class NimbusClient {
             courier: order.shipment?.courier_name || "Allocated courier",
             cost: order.shipment?.price?.total ?? order.shipment?.amount ?? 0,
             alreadyBooked: true,
-            warningCode: "PICKUP_ALREADY_SCHEDULED",
-            warning: warning || 'Order cannot be booked - current status is "pickup_scheduled". Only orders in "created" status can be booked. The existing shipment was kept as successful.',
+            warningCode: pending ? "PICKUP_ALREADY_PENDING" : "PICKUP_ALREADY_SCHEDULED",
+            warning: warning || `Order cannot be booked - current status is "${pending ? "pickup_pending" : "pickup_scheduled"}". Only orders in "created" status can be booked. The existing shipment was kept as successful.`,
         };
     }
     async resolveOrder(orderNumber, signal) {

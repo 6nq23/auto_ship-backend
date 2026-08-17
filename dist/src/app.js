@@ -16,6 +16,7 @@ import { WhatsAppClient } from "./whatsapp.js";
 import { WhatsAppRouter } from "./whatsapp-router.js";
 import { createAiOrchestrator } from "./ai-providers.js";
 import { normalizePhoneNumber } from "./identifiers.js";
+const SHIPPING_CHUNK_SIZE = 10;
 export async function createApp(config, storeOverride, scheduleBackground) {
     const store = storeOverride || new PrismaStore(config.databaseUrl, config.databaseSsl, config.mockMode, config.initialAdminPassword);
     await store.init();
@@ -78,16 +79,13 @@ export async function createApp(config, storeOverride, scheduleBackground) {
             job = await store.claimShippingJob(jobId);
             if (!job || job.status === "completed" || job.status === "failed")
                 return;
-            if (job.status === "processing" && job.processed > 0) {
-                job.processed = 0;
-                job.shipped = [];
-                job.failed = [];
-                job.labelUrl = null;
-                job.pickupScheduledLabelUrl = null;
-                appendLog(job, "info", "Server restarted; safely rechecking every order before continuing.");
-            }
+            const completedOrders = new Set([...job.shipped, ...job.failed].map((item) => item.orderNumber));
+            const remainingOrders = job.orderNumbers.filter((orderNumber) => !completedOrders.has(orderNumber));
+            job.processed = completedOrders.size;
             job.status = "processing";
-            appendLog(job, "info", `Shipment started for ${job.total} order${job.total === 1 ? "" : "s"}.`);
+            appendLog(job, "info", job.processed
+                ? `Resuming shipment at ${job.processed}/${job.total} completed orders.`
+                : `Shipment started for ${job.total} order${job.total === 1 ? "" : "s"}.`);
             await store.updateShippingJob(job);
             let persistence = Promise.resolve();
             const recordProgress = async (event) => {
@@ -130,12 +128,36 @@ export async function createApp(config, storeOverride, scheduleBackground) {
                 persistence = persistence.then(() => store.updateShippingJob(job));
                 await persistence;
             };
-            const outcome = await nimbus.shipMany(job.orderNumbers, 5, recordProgress);
+            const chunk = remainingOrders.slice(0, SHIPPING_CHUNK_SIZE);
+            if (chunk.length)
+                await nimbus.shipMany(chunk, 5, recordProgress, false);
             await persistence;
-            job.shipped = outcome.shipped;
-            job.failed = outcome.failed;
-            job.labelUrl = outcome.labelUrl;
-            job.pickupScheduledLabelUrl = outcome.pickupScheduledLabelUrl;
+            job.processed = job.shipped.length + job.failed.length;
+            if (job.processed < job.total) {
+                job.status = "queued";
+                appendLog(job, "info", `Saved progress at ${job.processed}/${job.total}. The next chunk will continue automatically.`);
+                await store.updateShippingJob(job);
+                return;
+            }
+            if (job.shipped.length) {
+                appendLog(job, "info", `Generating labels for ${job.shipped.length} shipped order${job.shipped.length === 1 ? "" : "s"}.`);
+                try {
+                    job.labelUrl = await nimbus.generateLabels(job.shipped.map((item) => item.orderId));
+                    appendLog(job, "success", "Merged shipping labels are ready to download.");
+                }
+                catch (error) {
+                    appendLog(job, "error", `Shipments were booked, but label generation failed: ${error instanceof Error ? error.message : "NimbusPost label request failed"}`);
+                }
+                const pickupRecovered = job.shipped.filter((item) => ["PICKUP_ALREADY_SCHEDULED", "PICKUP_ALREADY_PENDING"].includes(item.warningCode || ""));
+                if (pickupRecovered.length) {
+                    try {
+                        job.pickupScheduledLabelUrl = await nimbus.generateLabels(pickupRecovered.map((item) => item.orderId));
+                    }
+                    catch (error) {
+                        appendLog(job, "error", `Pickup-status label generation failed: ${error instanceof Error ? error.message : "NimbusPost label request failed"}`);
+                    }
+                }
+            }
             job.status = "completed";
             job.processed = job.total;
             appendLog(job, job.failed.length ? "error" : "success", `Shipment finished: ${job.shipped.length} shipped, ${job.failed.length} failed.`);
@@ -228,7 +250,10 @@ export async function createApp(config, storeOverride, scheduleBackground) {
         }
     });
     app.get("/api/shipping-jobs/active", authenticate, async (request, response, next) => { try {
-        response.json({ job: await store.getActiveShippingJob(request.auth.username) || null });
+        const job = await store.getActiveShippingJob(request.auth.username) || null;
+        response.json({ job });
+        if (job && ["queued", "processing"].includes(job.status))
+            runInBackground(processJob(job.jobId));
     }
     catch (error) {
         next(error);
@@ -241,6 +266,8 @@ export async function createApp(config, storeOverride, scheduleBackground) {
             if (request.auth.role !== "admin" && job.createdBy.toLowerCase() !== request.auth.username.toLowerCase())
                 return response.status(403).json({ error: "You cannot view this shipment job." });
             response.json({ job });
+            if (["queued", "processing"].includes(job.status))
+                runInBackground(processJob(job.jobId));
         }
         catch (error) {
             next(error);
@@ -272,9 +299,9 @@ export async function createApp(config, storeOverride, scheduleBackground) {
             if (!batch)
                 return response.status(404).json({ error: "Shipping batch was not found." });
             const pickupOnly = request.body?.scope === "pickup_scheduled";
-            const shipments = pickupOnly ? batch.shipped.filter((item) => item.warningCode === "PICKUP_ALREADY_SCHEDULED") : batch.shipped;
+            const shipments = pickupOnly ? batch.shipped.filter((item) => ["PICKUP_ALREADY_SCHEDULED", "PICKUP_ALREADY_PENDING"].includes(item.warningCode || "")) : batch.shipped;
             if (!shipments.length)
-                return response.status(400).json({ error: pickupOnly ? "This batch has no pickup-scheduled shipments to print." : "This batch has no successful shipments to print." });
+                return response.status(400).json({ error: pickupOnly ? "This batch has no pickup-pending or pickup-scheduled shipments to print." : "This batch has no successful shipments to print." });
             const labelUrl = await nimbus.generateLabels(shipments.map((item) => item.orderId));
             response.json({ labelUrl });
         }

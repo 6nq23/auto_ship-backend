@@ -146,10 +146,10 @@ export async function createApp(config: AppConfig, storeOverride?: Store, schedu
         } catch (error) {
           appendLog(job, "error", `Shipments were booked, but label generation failed: ${error instanceof Error ? error.message : "NimbusPost label request failed"}`);
         }
-        const pickupScheduled = job.shipped.filter((item) => item.warningCode === "PICKUP_ALREADY_SCHEDULED");
-        if (pickupScheduled.length) {
-          try { job.pickupScheduledLabelUrl = await nimbus.generateLabels(pickupScheduled.map((item) => item.orderId)); }
-          catch (error) { appendLog(job, "error", `Pickup-scheduled label generation failed: ${error instanceof Error ? error.message : "NimbusPost label request failed"}`); }
+        const pickupRecovered = job.shipped.filter((item) => ["PICKUP_ALREADY_SCHEDULED", "PICKUP_ALREADY_PENDING"].includes(item.warningCode || ""));
+        if (pickupRecovered.length) {
+          try { job.pickupScheduledLabelUrl = await nimbus.generateLabels(pickupRecovered.map((item) => item.orderId)); }
+          catch (error) { appendLog(job, "error", `Pickup-status label generation failed: ${error instanceof Error ? error.message : "NimbusPost label request failed"}`); }
         }
       }
       job.status = "completed"; job.processed = job.total; appendLog(job, job.failed.length ? "error" : "success", `Shipment finished: ${job.shipped.length} shipped, ${job.failed.length} failed.`);
@@ -225,8 +225,8 @@ export async function createApp(config: AppConfig, storeOverride?: Store, schedu
       const batch = (await store.getHistory()).find((item) => item.batchId === String(request.params.batchId));
       if (!batch) return response.status(404).json({ error: "Shipping batch was not found." });
       const pickupOnly = request.body?.scope === "pickup_scheduled";
-      const shipments = pickupOnly ? batch.shipped.filter((item) => item.warningCode === "PICKUP_ALREADY_SCHEDULED") : batch.shipped;
-      if (!shipments.length) return response.status(400).json({ error: pickupOnly ? "This batch has no pickup-scheduled shipments to print." : "This batch has no successful shipments to print." });
+      const shipments = pickupOnly ? batch.shipped.filter((item) => ["PICKUP_ALREADY_SCHEDULED", "PICKUP_ALREADY_PENDING"].includes(item.warningCode || "")) : batch.shipped;
+      if (!shipments.length) return response.status(400).json({ error: pickupOnly ? "This batch has no pickup-pending or pickup-scheduled shipments to print." : "This batch has no successful shipments to print." });
       const labelUrl = await nimbus.generateLabels(shipments.map((item) => item.orderId));
       response.json({ labelUrl });
     } catch (error) { next(error); }
