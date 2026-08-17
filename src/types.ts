@@ -3,7 +3,7 @@ export type UserRecord = { id: number; username: string; passwordHash: string; r
 export type ShippedOrder = { orderNumber: string; orderId: string; awb: string; courier: string; cost: number; alreadyBooked?: boolean; warningCode?: string; warning?: string };
 export type FailedOrder = { orderNumber: string; error: string; code: string };
 export type ShippingLog = { at: string; level: "info" | "success" | "error"; message: string; orderNumber?: string };
-export type Batch = { batchId: string; createdAt: string; shippedBy: string; shipped: ShippedOrder[]; failed: FailedOrder[]; labelUrl: string | null; totalShipped: number; totalFailed: number; demoMode: boolean; logs?: ShippingLog[] };
+export type Batch = { batchId: string; createdAt: string; shippedBy: string; shipped: ShippedOrder[]; failed: FailedOrder[]; labelUrl: string | null; pickupScheduledLabelUrl?: string | null; totalShipped: number; totalFailed: number; demoMode: boolean; logs?: ShippingLog[] };
 export type ShippingJobStatus = "queued" | "processing" | "completed" | "failed";
 export type ShippingJob = {
   jobId: string;
@@ -17,6 +17,7 @@ export type ShippingJob = {
   shipped: ShippedOrder[];
   failed: FailedOrder[];
   labelUrl: string | null;
+  pickupScheduledLabelUrl?: string | null;
   logs: ShippingLog[];
   error?: string;
   result?: Batch;
@@ -29,7 +30,10 @@ export type NimbusProgressEvent =
   | { type: "failed"; orderNumber: string; item: FailedOrder }
   | { type: "labels_started"; count: number }
   | { type: "labels_ready"; labelUrl: string }
-  | { type: "labels_failed"; error: string };
+  | { type: "labels_failed"; error: string }
+  | { type: "pickup_labels_started"; count: number }
+  | { type: "pickup_labels_ready"; labelUrl: string }
+  | { type: "pickup_labels_failed"; error: string };
 export type OrderMatch = {
   order_id: string;
   order_number: string;

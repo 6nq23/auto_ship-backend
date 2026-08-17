@@ -45,6 +45,7 @@ export class NimbusClient {
         shipped.sort((a, b) => orderNumbers.indexOf(a.orderNumber) - orderNumbers.indexOf(b.orderNumber));
         failed.sort((a, b) => orderNumbers.indexOf(a.orderNumber) - orderNumbers.indexOf(b.orderNumber));
         let labelUrl = null;
+        let pickupScheduledLabelUrl = null;
         if (shipped.length) {
             await onProgress?.({ type: "labels_started", count: shipped.length });
             try {
@@ -56,7 +57,19 @@ export class NimbusClient {
                 await onProgress?.({ type: "labels_failed", error: parsed.error });
             }
         }
-        return { shipped, failed, labelUrl };
+        const pickupScheduled = shipped.filter((item) => item.warningCode === "PICKUP_ALREADY_SCHEDULED");
+        if (pickupScheduled.length) {
+            await onProgress?.({ type: "pickup_labels_started", count: pickupScheduled.length });
+            try {
+                pickupScheduledLabelUrl = await this.labels(pickupScheduled.map((item) => item.orderId));
+                await onProgress?.({ type: "pickup_labels_ready", labelUrl: pickupScheduledLabelUrl });
+            }
+            catch (error) {
+                const parsed = this.describeError(error);
+                await onProgress?.({ type: "pickup_labels_failed", error: parsed.error });
+            }
+        }
+        return { shipped, failed, labelUrl, pickupScheduledLabelUrl };
     }
     async generateLabels(orderIds) {
         if (!orderIds.length)
@@ -245,13 +258,13 @@ export class NimbusClient {
         if (this.config.mockMode)
             return `/demo-labels?ids=${encodeURIComponent(ids.join(","))}`;
         try {
-            const response = await this.request("/v2/shipments/labels", { method: "POST", body: JSON.stringify({ order_ids: ids }) });
+            const response = await this.request("/v2/shipments/labels", { method: "POST", body: JSON.stringify({ ids }) });
             return response.data.url;
         }
         catch (error) {
-            if (!(error instanceof AppError) || !/\bids\b/i.test(error.message))
+            if (!(error instanceof AppError) || !/\border_ids\b/i.test(error.message))
                 throw error;
-            const response = await this.request("/v2/shipments/labels", { method: "POST", body: JSON.stringify({ ids }) });
+            const response = await this.request("/v2/shipments/labels", { method: "POST", body: JSON.stringify({ order_ids: ids }) });
             return response.data.url;
         }
     }

@@ -83,6 +83,7 @@ export async function createApp(config, storeOverride, scheduleBackground) {
                 job.shipped = [];
                 job.failed = [];
                 job.labelUrl = null;
+                job.pickupScheduledLabelUrl = null;
                 appendLog(job, "info", "Server restarted; safely rechecking every order before continuing.");
             }
             job.status = "processing";
@@ -118,16 +119,27 @@ export async function createApp(config, storeOverride, scheduleBackground) {
                 }
                 if (event.type === "labels_failed")
                     appendLog(job, "error", `Shipments were booked, but label generation failed: ${event.error}`);
+                if (event.type === "pickup_labels_started")
+                    appendLog(job, "info", `Generating a separate label PDF for ${event.count} pickup-scheduled order${event.count === 1 ? "" : "s"}.`);
+                if (event.type === "pickup_labels_ready") {
+                    job.pickupScheduledLabelUrl = event.labelUrl;
+                    appendLog(job, "success", "Pickup-scheduled labels are ready in a separate PDF.");
+                }
+                if (event.type === "pickup_labels_failed")
+                    appendLog(job, "error", `Pickup-scheduled shipments were recovered, but their separate label PDF failed: ${event.error}`);
                 persistence = persistence.then(() => store.updateShippingJob(job));
                 await persistence;
             };
             const outcome = await nimbus.shipMany(job.orderNumbers, 5, recordProgress);
             await persistence;
+            job.shipped = outcome.shipped;
+            job.failed = outcome.failed;
             job.labelUrl = outcome.labelUrl;
+            job.pickupScheduledLabelUrl = outcome.pickupScheduledLabelUrl;
             job.status = "completed";
             job.processed = job.total;
             appendLog(job, job.failed.length ? "error" : "success", `Shipment finished: ${job.shipped.length} shipped, ${job.failed.length} failed.`);
-            const batch = { batchId: job.jobId, createdAt: job.createdAt, shippedBy: job.createdBy, shipped: job.shipped, failed: job.failed, labelUrl: job.labelUrl, totalShipped: job.shipped.length, totalFailed: job.failed.length, demoMode: config.mockMode, logs: [...job.logs] };
+            const batch = { batchId: job.jobId, createdAt: job.createdAt, shippedBy: job.createdBy, shipped: job.shipped, failed: job.failed, labelUrl: job.labelUrl, pickupScheduledLabelUrl: job.pickupScheduledLabelUrl, totalShipped: job.shipped.length, totalFailed: job.failed.length, demoMode: config.mockMode, logs: [...job.logs] };
             job.result = batch;
             await store.addBatch(batch);
             await store.updateShippingJob(job);
@@ -203,7 +215,7 @@ export async function createApp(config, storeOverride, scheduleBackground) {
             if (active)
                 return response.status(409).json({ error: "A shipment is already running for this account.", job: active });
             const now = new Date().toISOString();
-            const job = { jobId: crypto.randomUUID(), createdAt: now, updatedAt: now, createdBy: request.auth.username, status: "queued", orderNumbers, processed: 0, total: orderNumbers.length, shipped: [], failed: [], labelUrl: null, logs: [{ at: now, level: "info", message: `Shipment job created for ${orderNumbers.length} order${orderNumbers.length === 1 ? "" : "s"}.` }] };
+            const job = { jobId: crypto.randomUUID(), createdAt: now, updatedAt: now, createdBy: request.auth.username, status: "queued", orderNumbers, processed: 0, total: orderNumbers.length, shipped: [], failed: [], labelUrl: null, pickupScheduledLabelUrl: null, logs: [{ at: now, level: "info", message: `Shipment job created for ${orderNumbers.length} order${orderNumbers.length === 1 ? "" : "s"}.` }] };
             if (!(await store.createShippingJob(job))) {
                 const existing = await store.getActiveShippingJob(request.auth.username);
                 return response.status(409).json({ error: "A shipment is already running for this account.", job: existing });
@@ -259,9 +271,11 @@ export async function createApp(config, storeOverride, scheduleBackground) {
             const batch = (await store.getHistory()).find((item) => item.batchId === String(request.params.batchId));
             if (!batch)
                 return response.status(404).json({ error: "Shipping batch was not found." });
-            if (!batch.shipped.length)
-                return response.status(400).json({ error: "This batch has no successful shipments to print." });
-            const labelUrl = await nimbus.generateLabels(batch.shipped.map((item) => item.orderId));
+            const pickupOnly = request.body?.scope === "pickup_scheduled";
+            const shipments = pickupOnly ? batch.shipped.filter((item) => item.warningCode === "PICKUP_ALREADY_SCHEDULED") : batch.shipped;
+            if (!shipments.length)
+                return response.status(400).json({ error: pickupOnly ? "This batch has no pickup-scheduled shipments to print." : "This batch has no successful shipments to print." });
+            const labelUrl = await nimbus.generateLabels(shipments.map((item) => item.orderId));
             response.json({ labelUrl });
         }
         catch (error) {
@@ -343,12 +357,22 @@ let serverlessAppPromise;
  * connect to PostgreSQL, and reuse the Express app across warm invocations.
  */
 export default async function handler(request, response) {
-    if (!serverlessAppPromise) {
-        serverlessAppPromise = createApp(loadConfig(), undefined, (task) => waitUntil(task)).catch((error) => {
-            serverlessAppPromise = undefined;
-            throw error;
-        });
+    try {
+        if (!serverlessAppPromise) {
+            serverlessAppPromise = Promise.resolve().then(() => createApp(loadConfig(), undefined, (task) => waitUntil(task))).catch((error) => {
+                serverlessAppPromise = undefined;
+                throw error;
+            });
+        }
+        const app = await serverlessAppPromise;
+        return app(request, response);
     }
-    const app = await serverlessAppPromise;
-    return app(request, response);
+    catch (error) {
+        console.error("AutoShip backend startup failed", error);
+        const message = error instanceof Error ? error.message : "Unknown startup error";
+        const code = message.includes("JWT_SECRET") ? "INVALID_JWT_SECRET" : message.includes("DATABASE_URL") || message.toLowerCase().includes("database") || message.toLowerCase().includes("postgres") ? "DATABASE_STARTUP_FAILED" : "BACKEND_STARTUP_FAILED";
+        response.statusCode = 503;
+        response.setHeader("Content-Type", "application/json; charset=utf-8");
+        return response.end(JSON.stringify({ error: "The backend could not start. Check the deployment environment variables and logs.", code }));
+    }
 }
