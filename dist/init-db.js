@@ -4,6 +4,7 @@ import dotenv from "dotenv";
 import { PrismaStore } from "./src/store.js";
 const serverDirectory = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.join(serverDirectory, "..", ".env") });
+dotenv.config({ path: path.join(serverDirectory, ".env") });
 async function initDb() {
     const databaseUrl = process.env.DATABASE_URL;
     if (!databaseUrl)

@@ -60,9 +60,11 @@ export class PrismaStore {
         order_number TEXT,
         provider_message_id TEXT,
         sender_type TEXT NOT NULL DEFAULT 'bot',
+        ai_provider TEXT,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
       ALTER TABLE wa_messages ADD COLUMN IF NOT EXISTS sender_type TEXT NOT NULL DEFAULT 'bot';
+      ALTER TABLE wa_messages ADD COLUMN IF NOT EXISTS ai_provider TEXT;
       UPDATE wa_messages SET sender_type = 'customer' WHERE direction = 'inbound' AND sender_type = 'bot';
       CREATE UNIQUE INDEX IF NOT EXISTS wa_messages_provider_id_idx ON wa_messages (provider_message_id) WHERE provider_message_id IS NOT NULL;
       CREATE INDEX IF NOT EXISTS wa_messages_phone_idx ON wa_messages (phone, created_at DESC);
@@ -210,10 +212,25 @@ export class PrismaStore {
         });
     }
     async addWhatsAppMessage(message) {
-        const rowCount = await this.prisma.$executeRawUnsafe(`INSERT INTO wa_messages (phone, direction, message_text, intent, order_number, provider_message_id, sender_type)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       ON CONFLICT (provider_message_id) WHERE provider_message_id IS NOT NULL DO NOTHING`, message.phone, message.direction, message.text, message.intent || null, message.orderNumber || null, message.providerMessageId || null, message.source || (message.direction === "inbound" ? "customer" : "bot"));
+        const rowCount = await this.prisma.$executeRawUnsafe(`INSERT INTO wa_messages (phone, direction, message_text, intent, order_number, provider_message_id, sender_type, ai_provider)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (provider_message_id) WHERE provider_message_id IS NOT NULL DO NOTHING`, message.phone, message.direction, message.text, message.intent || null, message.orderNumber || null, message.providerMessageId || null, message.source || (message.direction === "inbound" ? "customer" : "bot"), message.aiProvider || null);
         return rowCount === 1;
+    }
+    async getConversationHistory(phone, limit) {
+        const safeLimit = Math.max(1, Math.min(50, Math.trunc(limit)));
+        const rows = await this.prisma.$queryRawUnsafe("SELECT id, phone, direction, message_text, intent, order_number, provider_message_id, sender_type, ai_provider, created_at FROM wa_messages WHERE phone = $1 ORDER BY created_at DESC LIMIT $2", phone, safeLimit);
+        return rows.reverse().map(mapWhatsAppMessage);
+    }
+    async incrementAiTurnCount(phone) {
+        const conversation = await this.getConversation(phone);
+        const count = Number(conversation?.context.aiTurnCount || 0) + 1;
+        await this.saveConversation({ phone, step: "ai_active", context: { ...(conversation?.step === "ai_active" ? conversation.context : {}), aiTurnCount: count } });
+        return count;
+    }
+    async getAiTurnCount(phone) {
+        const conversation = await this.getConversation(phone);
+        return conversation?.step === "ai_active" ? Number(conversation.context.aiTurnCount || 0) : 0;
     }
     async getConversation(phone) {
         const rows = await this.prisma.$queryRawUnsafe("SELECT phone, intent, step, context, updated_at, expires_at FROM wa_conversations WHERE phone = $1 AND expires_at > NOW()", phone);
@@ -260,7 +277,7 @@ export class PrismaStore {
     }
     async getSupportOverview() {
         const [messageResult, ticketResult, conversationResult, pauseResult, statsResult] = await Promise.all([
-            this.prisma.$queryRawUnsafe("SELECT id, phone, direction, message_text, intent, order_number, provider_message_id, sender_type, created_at FROM wa_messages ORDER BY created_at DESC LIMIT 200"),
+            this.prisma.$queryRawUnsafe("SELECT id, phone, direction, message_text, intent, order_number, provider_message_id, sender_type, ai_provider, created_at FROM wa_messages ORDER BY created_at DESC LIMIT 200"),
             this.prisma.$queryRawUnsafe("SELECT ticket_id, phone, order_number, category, description, status, created_at, resolved_at FROM support_tickets ORDER BY created_at DESC LIMIT 100"),
             this.prisma.$queryRawUnsafe("SELECT phone, intent, step, context, updated_at, expires_at FROM wa_conversations WHERE expires_at > NOW() ORDER BY updated_at DESC LIMIT 100"),
             this.prisma.$queryRawUnsafe("SELECT phone, reason, paused_at, expires_at FROM wa_bot_pauses WHERE expires_at > NOW() ORDER BY paused_at DESC LIMIT 200"),
@@ -272,7 +289,7 @@ export class PrismaStore {
         ]);
         const stats = statsResult[0];
         return {
-            messages: messageResult.map((row) => ({ id: row.id.toString(), phone: row.phone, direction: row.direction, text: row.message_text, ...(row.intent ? { intent: row.intent } : {}), ...(row.order_number ? { orderNumber: row.order_number } : {}), ...(row.provider_message_id ? { providerMessageId: row.provider_message_id } : {}), ...(row.sender_type ? { source: row.sender_type } : {}), createdAt: row.created_at.toISOString() })),
+            messages: messageResult.map(mapWhatsAppMessage),
             tickets: ticketResult.map((row) => ({ ticketId: row.ticket_id, phone: row.phone, ...(row.order_number ? { orderNumber: row.order_number } : {}), category: row.category, ...(row.description ? { description: row.description } : {}), status: row.status, createdAt: row.created_at.toISOString(), ...(row.resolved_at ? { resolvedAt: row.resolved_at.toISOString() } : {}) })),
             conversations: conversationResult.map((row) => ({ phone: row.phone, ...(row.intent ? { intent: row.intent } : {}), step: row.step, context: typeof row.context === "string" ? JSON.parse(row.context) : row.context, updatedAt: row.updated_at.toISOString(), expiresAt: row.expires_at.toISOString() })),
             botPauses: pauseResult.map((row) => ({ phone: row.phone, reason: row.reason, pausedAt: row.paused_at.toISOString(), expiresAt: row.expires_at.toISOString() })),
@@ -280,4 +297,7 @@ export class PrismaStore {
         };
     }
     async close() { await this.prisma.$disconnect(); }
+}
+function mapWhatsAppMessage(row) {
+    return { id: row.id.toString(), phone: row.phone, direction: row.direction, text: row.message_text, ...(row.intent ? { intent: row.intent } : {}), ...(row.order_number ? { orderNumber: row.order_number } : {}), ...(row.provider_message_id ? { providerMessageId: row.provider_message_id } : {}), ...(row.sender_type ? { source: row.sender_type } : {}), ...(row.ai_provider ? { aiProvider: row.ai_provider } : {}), createdAt: row.created_at.toISOString() };
 }

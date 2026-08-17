@@ -32,6 +32,9 @@ class MemoryStore implements Store {
   async getPendingShippingJobs() { return [...this.jobs.values()].filter((job) => ["queued", "processing"].includes(job.status)).map((job) => structuredClone(job)); }
   async withConversationLock<T>(_phone: string, task: () => Promise<T>) { return task(); }
   async addWhatsAppMessage(message: Omit<WhatsAppMessage, "id" | "createdAt">) { if (message.providerMessageId && this.messages.some((item) => item.providerMessageId === message.providerMessageId)) return false; this.messages.unshift({ ...message, id: String(this.messages.length + 1), createdAt: new Date().toISOString() }); return true; }
+  async getConversationHistory(phone: string, limit: number) { return this.messages.filter((message) => message.phone === phone).slice(0, limit).reverse(); }
+  async incrementAiTurnCount(phone: string) { const next = await this.getAiTurnCount(phone) + 1; await this.saveConversation({ phone, step: "ai_active", context: { aiTurnCount: next } }); return next; }
+  async getAiTurnCount(phone: string) { const conversation = await this.getConversation(phone); return conversation?.step === "ai_active" ? Number(conversation.context.aiTurnCount || 0) : 0; }
   async getConversation(phone: string) { const conversation = this.conversations.get(phone); return conversation ? structuredClone(conversation) : undefined; }
   async saveConversation(conversation: Omit<SupportConversation, "updatedAt" | "expiresAt">) { const now = new Date(); this.conversations.set(conversation.phone, { ...structuredClone(conversation), updatedAt: now.toISOString(), expiresAt: new Date(now.getTime() + 24 * 60 * 60_000).toISOString() }); }
   async clearConversation(phone: string) { this.conversations.delete(phone); }
@@ -108,5 +111,20 @@ describe("AutoShip API", () => {
     expect(overview.body.messages.some((message: WhatsAppMessage) => message.direction === "outbound")).toBe(false);
     const resumed = await request(app).patch(`/api/support/bot-pauses/${phone}`).set("Authorization", `Bearer ${token}`).send({ paused: false });
     expect(resumed.status).toBe(200);
+  });
+  it("lets an admin reply from a phone-specific chat and pauses the bot", async () => {
+    const app = await makeApp(); const token = await login(app); const phone = "919876543210";
+    const sent = await request(app).post("/api/support/messages").set("Authorization", `Bearer ${token}`).send({ phone, text: "I am checking this for you." });
+    expect(sent.status).toBe(201);
+    const overview = await request(app).get("/api/support/overview").set("Authorization", `Bearer ${token}`);
+    expect(overview.body.messages).toEqual([expect.objectContaining({ phone, direction: "outbound", source: "agent", text: "I am checking this for you." })]);
+    expect(overview.body.botPauses).toEqual([expect.objectContaining({ phone, reason: "agent_message" })]);
+  });
+  it("reports AI status without exposing provider keys", async () => {
+    const app = await makeApp(); const token = await login(app);
+    const response = await request(app).get("/api/settings/ai-status").set("Authorization", `Bearer ${token}`);
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ enabled: false, configuredProviders: [], primaryProvider: null, maxTurns: 3, escalationPhone: "919876543210" });
+    expect(JSON.stringify(response.body)).not.toContain("ApiKey");
   });
 });

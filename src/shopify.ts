@@ -47,11 +47,11 @@ const SUPPORT_ORDERS_QUERY = `#graphql
 `;
 
 const CUSTOMER_ORDERS_BY_PHONE_QUERY = `#graphql
-  query SupportCustomerOrders($identifier: CustomerIdentifierInput!, $first: Int!) {
+  query SupportCustomerOrders($identifier: CustomerIdentifierInput!, $first: Int!, $after: String) {
     customerByIdentifier(identifier: $identifier) {
       id
       defaultPhoneNumber { phoneNumber }
-      orders(first: $first, sortKey: CREATED_AT, reverse: true) {
+      orders(first: $first, after: $after, sortKey: CREATED_AT, reverse: true) {
         nodes {
           id
           name
@@ -66,6 +66,7 @@ const CUSTOMER_ORDERS_BY_PHONE_QUERY = `#graphql
           lineItems(first: 20) { nodes { title quantity sku } }
           fulfillments { trackingInfo { number url company } }
         }
+        pageInfo { hasNextPage endCursor }
       }
     }
   }
@@ -126,15 +127,34 @@ export class ShopifyClient {
     const normalized = normalizePhoneNumber(phone);
     if (!normalized) return [];
     if (this.config.mockMode) return [this.mockOrder("#RBD5001"), this.mockOrder("#RBD4998")].filter((order): order is ShopifyOrder => Boolean(order));
-    const data = await this.graphql<{ customerByIdentifier: { id: string; defaultPhoneNumber?: { phoneNumber?: string }; orders: { nodes: GraphQlOrder[] } } | null }>(CUSTOMER_ORDERS_BY_PHONE_QUERY, { identifier: { phoneNumber: `+91${normalized}` }, first: 100 });
-    if (data.customerByIdentifier) return this.mapOrders(data.customerByIdentifier.orders.nodes);
+
+    try {
+      const orders: GraphQlOrder[] = [];
+      let after: string | null = null;
+      let customerFound = false;
+      do {
+        const data: { customerByIdentifier: { id: string; defaultPhoneNumber?: { phoneNumber?: string }; orders: { nodes: GraphQlOrder[]; pageInfo?: { hasNextPage: boolean; endCursor?: string | null } } } | null } = await this.graphql(CUSTOMER_ORDERS_BY_PHONE_QUERY, {
+          identifier: { phoneNumber: `+91${normalized}` },
+          first: 100,
+          after,
+        });
+        if (!data.customerByIdentifier) break;
+        customerFound = true;
+        orders.push(...data.customerByIdentifier.orders.nodes);
+        const pageInfo: { hasNextPage: boolean; endCursor?: string | null } | undefined = data.customerByIdentifier.orders.pageInfo;
+        after = pageInfo?.hasNextPage && pageInfo.endCursor ? pageInfo.endCursor : null;
+      } while (after);
+      if (customerFound) return this.mapOrders(orders);
+    } catch (error) {
+      console.warn("[shopify] Direct customer phone lookup failed; trying Shopify customer search instead.", error);
+    }
 
     const variants = [`+91${normalized}`, `91${normalized}`, normalized];
     for (const candidate of variants) {
       const result = await this.graphql<{ customers: { nodes: Array<{ id: string; defaultPhoneNumber?: { phoneNumber?: string }; orders: { nodes: GraphQlOrder[] } }> } }>(CUSTOMERS_BY_PHONE_SEARCH_QUERY, {
         query: `phone:${this.escapeSearch(candidate)}`,
         customerFirst: 10,
-        orderFirst: 100,
+        orderFirst: 250,
       });
       const customers = result.customers.nodes.filter((customer) => !customer.defaultPhoneNumber?.phoneNumber || normalizePhoneNumber(customer.defaultPhoneNumber.phoneNumber) === normalized);
       if (customers.length) return this.mapOrders(customers.flatMap((customer) => customer.orders.nodes));

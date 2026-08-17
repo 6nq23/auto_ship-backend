@@ -42,7 +42,7 @@ export type OrderMatch = {
 };
 
 export type SupportIntent = "confirm_order" | "change_address" | "order_status" | "not_dispatched" | "order_failed" | "refund_return";
-export type ConversationStep = "waiting_menu" | "waiting_issue" | "waiting_order" | "waiting_pick" | "waiting_nimbus_verify" | "waiting_address" | "waiting_phone" | "waiting_confirm" | "waiting_ndr_choice";
+export type ConversationStep = "ai_active" | "waiting_menu" | "waiting_issue" | "waiting_order" | "waiting_pick" | "waiting_address" | "waiting_phone" | "waiting_confirm" | "waiting_ndr_choice";
 export type SupportConversation = {
   phone: string;
   intent?: SupportIntent;
@@ -59,6 +59,7 @@ export type WhatsAppMessage = {
   intent?: SupportIntent;
   orderNumber?: string;
   providerMessageId?: string;
+  aiProvider?: AiProviderName;
   source?: "customer" | "bot" | "agent";
   createdAt: string;
 };
@@ -80,6 +81,17 @@ export type SupportOverview = {
   conversations: SupportConversation[];
   botPauses: BotPause[];
   stats: { inboundToday: number; outboundToday: number; activeConversations: number; openTickets: number };
+};
+
+export type AiProviderName = "gemini" | "claude" | "openai";
+export type ChatMessage = { role: "user" | "assistant"; content: string };
+export type AiToolCall = { name: string; arguments: Record<string, unknown> };
+export type AiResponse = {
+  text: string;
+  toolCalls?: AiToolCall[];
+  resolved?: boolean;
+  escalate?: boolean;
+  provider?: AiProviderName;
 };
 
 export type ShopifyAddress = {

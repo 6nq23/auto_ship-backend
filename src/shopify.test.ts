@@ -30,7 +30,7 @@ describe("ShopifyClient", () => {
       const body = JSON.parse(String(init?.body)) as { query: string; variables: { identifier: { phoneNumber: string } } };
       expect(body.query).toContain("customerByIdentifier");
       expect(body.variables.identifier.phoneNumber).toBe("+919876543210");
-      return json({ data: { customerByIdentifier: { orders: { nodes: [{ id: "gid://shopify/Order/5001", name: "#RBD5001", createdAt: "2026-08-15T10:00:00Z", currentTotalPriceSet: { shopMoney: { amount: "499.00", currencyCode: "INR" } }, shippingAddress: { phone: "+91 98765 43210", address1: "12 MG Road", city: "Bengaluru", zip: "560001" }, lineItems: { nodes: [] }, fulfillments: [] }] } } } });
+      return json({ data: { customerByIdentifier: { orders: { nodes: [{ id: "gid://shopify/Order/5001", name: "#RBD5001", createdAt: "2026-08-15T10:00:00Z", currentTotalPriceSet: { shopMoney: { amount: "499.00", currencyCode: "INR" } }, shippingAddress: { phone: "+91 98765 43210", address1: "12 MG Road", city: "Bengaluru", zip: "560001" }, lineItems: { nodes: [] }, fulfillments: [] }], pageInfo: { hasNextPage: false } } } } });
     }));
 
     await expect(makeClient().getOrdersByPhone("0091 98765 43210")).resolves.toMatchObject([{ name: "#RBD5001" }]);
@@ -42,10 +42,23 @@ describe("ShopifyClient", () => {
       return json({ data: { customerByIdentifier: { id: "gid://shopify/Customer/1", defaultPhoneNumber: { phoneNumber: "+919876543210" }, orders: { nodes: [
         { id: "gid://shopify/Order/1", name: "#DR1001", createdAt: "2026-08-01T10:00:00Z", currentTotalPriceSet: { shopMoney: { amount: "499", currencyCode: "INR" } }, shippingAddress: { phone: "+919876543210", address1: "Current", city: "Delhi", zip: "110001" }, lineItems: { nodes: [] }, fulfillments: [] },
         { id: "gid://shopify/Order/2", name: "#DR900", createdAt: "2026-07-01T10:00:00Z", currentTotalPriceSet: { shopMoney: { amount: "299", currencyCode: "INR" } }, shippingAddress: { phone: "+919000000000", address1: "Old", city: "Delhi", zip: "110001" }, lineItems: { nodes: [] }, fulfillments: [] },
-      ] } } } });
+      ], pageInfo: { hasNextPage: false } } } } });
     }));
 
     await expect(makeClient().getOrdersByPhone("9876543210")).resolves.toMatchObject([{ name: "#DR1001" }, { name: "#DR900" }]);
+  });
+
+  it("falls back to Shopify customer search when the direct identifier query fails", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("/admin/oauth/access_token")) return json({ access_token: "access-token", expires_in: 3600 });
+      const body = JSON.parse(String(init?.body)) as { query: string; variables: Record<string, unknown> };
+      if (body.query.includes("customerByIdentifier")) return json({ errors: [{ message: "Identifier lookup unavailable" }] });
+      expect(body.query).toContain("customers(first:");
+      expect(body.variables.query).toBe('phone:"+919876543210"');
+      return json({ data: { customers: { nodes: [{ id: "gid://shopify/Customer/1", defaultPhoneNumber: { phoneNumber: "+919876543210" }, orders: { nodes: [{ id: "gid://shopify/Order/5001", name: "#RBD5001", createdAt: "2026-08-15T10:00:00Z", currentTotalPriceSet: { shopMoney: { amount: "499.00", currencyCode: "INR" } }, lineItems: { nodes: [] }, fulfillments: [] }] } }] } } });
+    }));
+
+    await expect(makeClient().getOrdersByPhone("+91 9876543210")).resolves.toMatchObject([{ name: "#RBD5001" }]);
   });
 
   it("sends validated orderUpdate input and surfaces Shopify user errors", async () => {

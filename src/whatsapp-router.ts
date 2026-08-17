@@ -1,9 +1,11 @@
+import fs from "node:fs/promises";
 import type { Store } from "./store.js";
 import type { NimbusClient } from "./nimbus.js";
 import type { ShopifyClient } from "./shopify.js";
 import type { IncomingWhatsAppMessage, WhatsAppClient } from "./whatsapp.js";
-import type { OrderMatch, ShopifyAddress, ShopifyOrder, SupportConversation, SupportIntent, SupportTicket } from "./types.js";
+import type { AiProviderName, AiToolCall, ChatMessage, OrderMatch, ShopifyAddress, ShopifyOrder, SupportConversation, SupportIntent, SupportTicket } from "./types.js";
 import { extractPhoneNumber, normalizeOrderNumber, normalizePhoneNumber } from "./identifiers.js";
+import type { AiOrchestrator } from "./ai-providers.js";
 
 const INTENTS: Record<string, SupportIntent> = {
   "1": "confirm_order",
@@ -30,7 +32,17 @@ export const classifyIntent = (text: string): SupportIntent | undefined => {
 export const extractOrderNumber = normalizeOrderNumber;
 export { extractPhoneNumber };
 
-type RouterDependencies = { store: Store; shopify: ShopifyClient; nimbus: NimbusClient; whatsapp: WhatsAppClient; supportPhone: string };
+type RouterDependencies = {
+  store: Store;
+  shopify: ShopifyClient;
+  nimbus: NimbusClient;
+  whatsapp: WhatsAppClient;
+  supportPhone: string;
+  ai?: AiOrchestrator;
+  aiMaxTurns?: number;
+  brainFilePath?: string;
+  escalationPhone?: string;
+};
 
 export class WhatsAppRouter {
   private readonly locks = new Map<string, Promise<void>>();
@@ -59,15 +71,77 @@ export class WhatsAppRouter {
     if (!inserted) return;
     if (await this.dependencies.store.isBotPaused?.(message.phone)) return;
     const conversation = await this.dependencies.store.getConversation(message.phone);
-    if (conversation) return this.resume(conversation, text);
+    if (conversation && conversation.step !== "ai_active") return this.resume(conversation, text);
+    if (this.dependencies.ai?.enabled) {
+      try { return await this.processWithAi(message.phone, text); }
+      catch (error) {
+        console.error(`[support:${message.phone}] AI routing failed; using deterministic fallback`, error);
+        await this.dependencies.store.clearConversation(message.phone).catch(() => undefined);
+      }
+    }
+    return this.processDeterministic(message.phone, text);
+  }
+
+  private async processDeterministic(phone: string, text: string) {
     const intent = classifyIntent(text);
-    if (!intent) return this.showMenu(message.phone);
+    if (!intent) return this.showMenu(phone);
     const context = intent === "refund_return" ? { ticketCategory: refundCategory(text) } : {};
-    if (intent === "refund_return" && context.ticketCategory === "other") return this.askRefundIssue(message.phone);
+    if (intent === "refund_return" && context.ticketCategory === "other") return this.askRefundIssue(phone);
     const orderNumber = extractOrderNumber(text);
     const phoneNumber = extractPhoneNumber(text);
-    if (orderNumber || phoneNumber) return this.resolveIdentifier(message.phone, intent, orderNumber || phoneNumber!, context);
-    await this.askForOrder(message.phone, intent, context);
+    if (orderNumber || phoneNumber) return this.resolveIdentifier(phone, intent, orderNumber || phoneNumber!, context);
+    await this.askForOrder(phone, intent, context);
+  }
+
+  private async processWithAi(phone: string, text: string) {
+    const ai = this.dependencies.ai!;
+    const turnCount = await this.dependencies.store.incrementAiTurnCount(phone);
+    const history = await this.dependencies.store.getConversationHistory(phone, 10);
+    const messages: ChatMessage[] = history.map((message) => ({ role: message.direction === "inbound" ? "user" : "assistant", content: message.text }));
+    const response = await ai.chat(messages, await this.loadBrain());
+    const toolCall = response.toolCalls?.[0];
+    if (toolCall) return this.executeAiTool(phone, toolCall);
+    if (response.escalate) return this.escalateToHuman(phone, response.text || "AI requested human support", "other");
+    if (!response.text) throw new Error("AI returned neither a reply nor a tool call");
+    if (!response.resolved && turnCount >= Math.max(1, this.dependencies.aiMaxTurns || 3)) return this.escalateToHuman(phone, "The AI agent could not resolve the conversation within the configured turn limit", "other");
+    if (response.resolved) await this.dependencies.store.clearConversation(phone);
+    await this.send(phone, response.text, undefined, undefined, response.provider);
+  }
+
+  private async executeAiTool(phone: string, toolCall: AiToolCall) {
+    const args = toolCall.arguments;
+    const rawIdentifier = String(args.identifier || args.order_number || args.phone || phone);
+    const identifier = extractOrderNumber(rawIdentifier) || extractPhoneNumber(rawIdentifier) || rawIdentifier;
+    if (toolCall.name === "lookup_order") return this.resolveIdentifier(phone, "confirm_order", identifier);
+    if (toolCall.name === "track_order") return this.resolveIdentifier(phone, "order_status", identifier);
+    if (toolCall.name === "check_dispatch") return this.resolveIdentifier(phone, "not_dispatched", identifier);
+    if (toolCall.name === "update_address") return this.resolveIdentifier(phone, "change_address", identifier);
+    if (toolCall.name === "failed_delivery") return this.resolveIdentifier(phone, "order_failed", identifier);
+    if (toolCall.name === "lookup_by_phone") {
+      const intent = isSupportIntent(args.intent) ? args.intent : "order_status";
+      return this.resolveIdentifier(phone, intent, String(args.phone || phone));
+    }
+    if (toolCall.name === "create_ticket") {
+      const category = isTicketCategory(args.category) ? args.category : "other";
+      return this.escalateToHuman(phone, String(args.reason || "Customer requested human support"), category, typeof args.order_number === "string" ? args.order_number : undefined);
+    }
+    throw new Error(`Unsupported AI tool: ${toolCall.name}`);
+  }
+
+  private async loadBrain() {
+    const filePath = this.dependencies.brainFilePath;
+    if (!filePath) return DEFAULT_BRAIN;
+    try { return await fs.readFile(filePath, "utf8"); }
+    catch (error) { console.error(`[support] Could not load brain file at ${filePath}; using built-in rules`, error); return DEFAULT_BRAIN; }
+  }
+
+  private async escalateToHuman(phone: string, reason: string, category: SupportTicket["category"], orderNumber?: string) {
+    const ticket: SupportTicket = { ticketId: crypto.randomUUID(), phone, ...(orderNumber ? { orderNumber } : {}), category, description: reason.slice(0, 2_000), status: "open", createdAt: new Date().toISOString() };
+    await this.dependencies.store.createSupportTicket(ticket);
+    await this.dependencies.store.clearConversation(phone);
+    const escalationPhone = String(this.dependencies.escalationPhone || this.dependencies.supportPhone || "").replace(/\D/g, "");
+    if (escalationPhone && escalationPhone !== phone) await this.dependencies.whatsapp.sendText(escalationPhone, `🚨 Customer ${phone} needs human help.${orderNumber ? `\nOrder: ${orderNumber}` : ""}\nReason: ${reason}\nTicket: ${ticket.ticketId.slice(0, 8)}`).catch((error) => console.error(`[support:${phone}] escalation notification failed`, error));
+    await this.send(phone, `I've connected you with our support team. Ticket ${ticket.ticketId.slice(0, 8)} has been created, and someone will follow up shortly. 🙏`, "refund_return", orderNumber);
   }
 
   private async resume(conversation: SupportConversation, text: string) {
@@ -94,24 +168,7 @@ export class WhatsAppRouter {
       const options = Array.isArray(context.orders) ? context.orders as Array<{ name: string; source?: "shopify" | "nimbus" }> : [];
       const selected = options[Number(text.trim()) - 1];
       if (!selected) return this.send(phone, `Reply with a number from 1 to ${options.length}.`, intent);
-      return this.dispatch(phone, intent, selected.name, { ...context, customerPhoneVerified: selected.source === "shopify" });
-    }
-    if (step === "waiting_nimbus_verify" && intent) {
-      const pincode = text.replace(/\D/g, "");
-      const orderNumber = String(context.orderNumber || "");
-      if (!/^\d{6}$/.test(pincode)) return this.send(phone, "Please reply with the 6-digit delivery PIN code for this order.", intent, orderNumber);
-      const order = await this.dependencies.nimbus.lookupOrder(orderNumber).catch(() => null);
-      const expectedPincode = String(order?.shipping_address?.pincode || "").replace(/\D/g, "");
-      if (!order || expectedPincode !== pincode) {
-        const retries = Number(context.retries || 0) + 1;
-        if (retries >= 3) {
-          await this.dependencies.store.clearConversation(phone);
-          return this.send(phone, `We couldn't verify that order. Please contact ${this.dependencies.supportPhone || "support"}.`, intent, orderNumber);
-        }
-        await this.save({ phone, intent, step, context: { ...context, retries } });
-        return this.send(phone, "That PIN code did not match the order. Please check the 6-digit delivery PIN code and try again.", intent, orderNumber);
-      }
-      return this.dispatch(phone, intent, orderNumber, { ...context, nimbusVerified: true });
+      return this.dispatch(phone, intent, selected.name, { ...context, phoneLookupVerified: true });
     }
     if (step === "waiting_address" && intent === "change_address") {
       const parsed = parseAddress(text);
@@ -160,10 +217,8 @@ export class WhatsAppRouter {
       await this.dependencies.store.clearConversation(phone);
       return this.send(phone, `For your security, order lookup must use the phone number connected to this WhatsApp chat. Please message us from the order phone or contact ${this.dependencies.supportPhone || "support"}.`);
     }
-    const [shopifyOrders, nimbusOrders] = await Promise.all([
-      this.dependencies.shopify.getOrdersByPhone(identifier).catch((error) => { console.error(`[support:${phone}] Shopify phone lookup failed`, error); return []; }),
-      this.dependencies.nimbus.getOrdersByPhone(identifier).catch((error) => { console.error(`[support:${phone}] Nimbus phone lookup failed`, error); return []; }),
-    ]);
+    const shopifyOrders = await this.dependencies.shopify.getOrdersByPhone(identifier).catch((error) => { console.error(`[support:${phone}] Shopify phone lookup failed`, error); return []; });
+    const nimbusOrders = shopifyOrders.length ? [] : await this.dependencies.nimbus.getOrdersByPhone(identifier).catch((error) => { console.error(`[support:${phone}] Nimbus phone lookup failed`, error); return []; });
     const orders = [
       ...shopifyOrders.map((order) => ({ name: order.name, source: "shopify" as const, summary: formatShopifyOrderSummary(order) })),
       ...nimbusOrders.map((order) => ({ name: order.order_number, source: "nimbus" as const, summary: `${order.items?.map((item) => `${item.name || "Item"} ×${item.qty || 1}`).join(", ") || "Order"}${order.order_status ? ` · ${humanStatus(order.order_status)}` : ""}` })),
@@ -172,11 +227,9 @@ export class WhatsAppRouter {
       await this.save({ phone, intent, step: "waiting_order", context: { ...context, retries: 1 } });
       return this.send(phone, "We couldn't find an order for that phone number. Check the number or send your RBD order number.", intent);
     }
-    if (orders.length === 1) return this.dispatch(phone, intent, orders[0].name, { ...context, customerPhoneVerified: orders[0].source === "shopify" });
-    const visibleOrders = orders.slice(0, 9);
-    await this.save({ phone, intent, step: "waiting_pick", context: { ...context, orders: visibleOrders.map((order) => ({ name: order.name, source: order.source })) } });
-    const choices = orders.slice(0, 9).map((order, index) => `${index + 1}️⃣ ${order.name} — ${order.summary}`).join("\n");
-    await this.send(phone, `We found these orders:\n${choices}\nReply with the number.`, intent);
+    if (orders.length === 1) return this.dispatch(phone, intent, orders[0].name, { ...context, phoneLookupVerified: true });
+    await this.save({ phone, intent, step: "waiting_pick", context: { ...context, orders: orders.map((order) => ({ name: order.name, source: order.source })) } });
+    await this.sendOrderChoices(phone, intent, orders);
   }
 
   private async dispatch(phone: string, intent: SupportIntent, orderNumber: string, context: Record<string, unknown> = {}) {
@@ -184,11 +237,7 @@ export class WhatsAppRouter {
       const shopifyOrder = await this.dependencies.shopify.getOrderByName(orderNumber).catch((error) => { console.error(`[support:${phone}] Shopify order lookup failed`, error); return null; });
       const nimbusOrder = shopifyOrder ? null : await this.dependencies.nimbus.lookupOrder(orderNumber).catch((error) => { console.error(`[support:${phone}] Nimbus order lookup failed`, error); return null; });
       if (!shopifyOrder && !nimbusOrder) throw new Error(`Order ${orderNumber} was not found in Shopify or NimbusPost`);
-      if (!shopifyOrder && nimbusOrder && !this.nimbusHasReadablePhone(nimbusOrder) && context.nimbusVerified !== true) {
-        await this.save({ phone, intent, step: "waiting_nimbus_verify", context: { ...context, orderNumber: nimbusOrder.order_number, retries: 0 } });
-        return await this.send(phone, `We found ${nimbusOrder.order_number}. To verify it securely, please reply with the 6-digit delivery PIN code.`, intent, nimbusOrder.order_number);
-      }
-      const belongsToSender = shopifyOrder ? context.customerPhoneVerified === true || this.orderBelongsToSender(shopifyOrder, phone) : context.nimbusVerified === true || this.nimbusOrderBelongsToSender(nimbusOrder!, phone);
+      const belongsToSender = context.phoneLookupVerified === true || (shopifyOrder ? this.orderBelongsToSender(shopifyOrder, phone) : this.nimbusOrderBelongsToSender(nimbusOrder!, phone));
       if (!belongsToSender) {
         await this.dependencies.store.clearConversation(phone);
         return await this.send(phone, `We couldn't verify that order against this WhatsApp number. Please message us from the phone used on the order or contact ${this.dependencies.supportPhone || "support"}.`);
@@ -359,17 +408,30 @@ export class WhatsAppRouter {
   private nimbusOrderBelongsToSender(order: OrderMatch, phone: string) {
     const sender = normalizePhoneNumber(phone);
     const candidates = [order.shipping_address?.phone, order.billing_address?.phone].filter((candidate) => candidate !== undefined);
-    return Boolean(sender && candidates.some((candidate) => normalizePhoneNumber(String(candidate)) === sender));
+    return Boolean(sender && candidates.some((candidate) => {
+      const value = String(candidate);
+      const normalized = normalizePhoneNumber(value);
+      if (normalized) return normalized === sender;
+      const visibleDigits = value.replace(/\D/g, "");
+      return /[x*]/i.test(value) && visibleDigits.length >= 2 && sender.endsWith(visibleDigits);
+    }));
   }
 
-  private nimbusHasReadablePhone(order: OrderMatch) {
-    const candidates = [order.shipping_address?.phone, order.billing_address?.phone].filter((candidate) => candidate !== undefined);
-    return candidates.some((candidate) => Boolean(normalizePhoneNumber(String(candidate))));
+  private async sendOrderChoices(phone: string, intent: SupportIntent, orders: Array<{ name: string; source?: "shopify" | "nimbus"; summary: string }>) {
+    const lines = orders.map((order, index) => `${index + 1}. ${order.name} — ${order.summary}`);
+    const chunks: string[] = [];
+    let chunk = orders.every((order) => order.source === "shopify") ? "We found these Shopify orders for your customer account:" : "We found these orders for your phone number:";
+    for (const line of lines) {
+      if (`${chunk}\n${line}`.length > 3_500) { chunks.push(chunk); chunk = line; }
+      else chunk += `\n${line}`;
+    }
+    chunks.push(`${chunk}\n\nReply with the order number from this list.`);
+    for (const message of chunks) await this.send(phone, message, intent);
   }
 
-  private async send(phone: string, text: string, intent?: SupportIntent, orderNumber?: string) {
+  private async send(phone: string, text: string, intent?: SupportIntent, orderNumber?: string, aiProvider?: AiProviderName) {
     await this.dependencies.whatsapp.sendText(phone, text);
-    await this.dependencies.store.addWhatsAppMessage({ phone, direction: "outbound", source: "bot", text, ...(intent ? { intent } : {}), ...(orderNumber ? { orderNumber } : {}) });
+    await this.dependencies.store.addWhatsAppMessage({ phone, direction: "outbound", source: "bot", text, ...(intent ? { intent } : {}), ...(orderNumber ? { orderNumber } : {}), ...(aiProvider ? { aiProvider } : {}) });
   }
 
   private save(conversation: Omit<SupportConversation, "updatedAt" | "expiresAt">) { return this.dependencies.store.saveConversation(conversation); }
@@ -395,6 +457,9 @@ const formatShopifyOrderSummary = (order: ShopifyOrder) => {
   const tracking = order.trackingInfo?.find((item) => item.number || item.url);
   return `${date} · ${items}${extraItems} · ${formatMoney(order)}${statuses ? ` · ${statuses}` : ""}${tracking?.number ? ` · AWB ${tracking.number}` : ""}`;
 };
+const isSupportIntent = (value: unknown): value is SupportIntent => typeof value === "string" && ["confirm_order", "change_address", "order_status", "not_dispatched", "order_failed", "refund_return"].includes(value);
+const isTicketCategory = (value: unknown): value is SupportTicket["category"] => typeof value === "string" && ["refund", "return", "missing", "other"].includes(value);
+const DEFAULT_BRAIN = "You are AutoShip support. Return JSON with text, toolCalls, resolved, and escalate. Never invent order facts; use a tool for every order question.";
 const formatDate = (value: string) => new Date(value).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" });
 const statusEmoji = (status: string) => /delivered/i.test(status) ? "✅" : /out for delivery/i.test(status) ? "🎉" : /ndr|fail/i.test(status) ? "⚠️" : /rto|return/i.test(status) ? "↩️" : "🚚";
 const humanStatus = (status: string) => status.replace(/\b\w/g, (letter) => letter.toUpperCase());

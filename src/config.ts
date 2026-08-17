@@ -1,6 +1,7 @@
 import path from "node:path";
 import dotenv from "dotenv";
 import type { AppConfig } from "./app.js";
+import type { AiProviderName } from "./types.js";
 
 export function loadConfig(): AppConfig {
   // Keep imports side-effect free. The root project file is canonical; the
@@ -14,10 +15,14 @@ export function loadConfig(): AppConfig {
   const getgabsConfigured = process.env.WHATSAPP_API_URL?.includes("getgabs.com") || Boolean(process.env.WHATSAPP_SENDER || process.env.WHATSAPP_CAMPAIGN_ID);
   const requestedWhatsAppProvider = process.env.WHATSAPP_PROVIDER || (process.env.WHATSAPP_PHONE_NUMBER_ID ? "meta" : getgabsConfigured ? "getgabs" : process.env.WHATSAPP_API_KEY ? "whapi" : "disabled");
   const whatsappProvider = (["disabled", "meta", "whapi", "getgabs"].includes(requestedWhatsAppProvider) ? requestedWhatsAppProvider : "disabled") as "disabled" | "meta" | "whapi" | "getgabs";
+  const requestedAiProvider = process.env.AI_PRIMARY_PROVIDER || "gemini";
+  const aiPrimaryProvider = (["gemini", "claude", "openai"].includes(requestedAiProvider) ? requestedAiProvider : "gemini") as AiProviderName;
+  const requestedAiMaxTurns = Number(process.env.AI_MAX_TURNS || 3);
+  const backendDirectory = process.env.VERCEL || path.basename(workspaceDirectory).toLowerCase() === "auto_ship-backend" ? workspaceDirectory : path.join(workspaceDirectory, "server");
 
   if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL is required. Copy .env.example to .env and set your PostgreSQL connection string.");
   if (!mockMode && (!process.env.NIMBUS_API_KEY || !process.env.NIMBUS_API_SECRET)) throw new Error("NIMBUS_API_KEY and NIMBUS_API_SECRET are required outside demo mode");
-  if (!mockMode && (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32)) throw new Error("JWT_SECRET must be at least 32 characters in production");
+  if (!mockMode && (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32 || process.env.JWT_SECRET === "replace-with-a-long-random-secret")) throw new Error("JWT_SECRET must be a unique random value of at least 32 characters in production");
 
   return {
     jwtSecret: process.env.JWT_SECRET || "local-demo-secret-not-for-production-use",
@@ -47,5 +52,15 @@ export function loadConfig(): AppConfig {
     whatsappTemplateName: process.env.WHATSAPP_TEMPLATE_NAME,
     whatsappTemplateLanguage: process.env.WHATSAPP_TEMPLATE_LANGUAGE || "en_US",
     supportPhone: process.env.SUPPORT_PHONE_NUMBER || process.env.Phonenumber,
+    geminiApiKey: process.env.GEMINI_API_KEY,
+    geminiModel: process.env.GEMINI_MODEL,
+    claudeApiKey: process.env.CLAUDE_API_KEY,
+    claudeModel: process.env.CLAUDE_MODEL,
+    openaiApiKey: process.env.OPENAI_API_KEY,
+    openaiModel: process.env.OPENAI_MODEL,
+    aiPrimaryProvider,
+    aiMaxTurns: Number.isFinite(requestedAiMaxTurns) ? Math.max(1, Math.trunc(requestedAiMaxTurns)) : 3,
+    brainFilePath: process.env.BRAIN_FILE_PATH || path.join(backendDirectory, "data", "brain.md"),
+    escalationPhone: process.env.ESCALATION_PHONE || process.env.SUPPORT_PHONE_NUMBER || process.env.Phonenumber || "919924863749",
   };
 }

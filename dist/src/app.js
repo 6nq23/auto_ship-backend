@@ -14,6 +14,8 @@ import { NimbusClient } from "./nimbus.js";
 import { ShopifyClient } from "./shopify.js";
 import { WhatsAppClient } from "./whatsapp.js";
 import { WhatsAppRouter } from "./whatsapp-router.js";
+import { createAiOrchestrator } from "./ai-providers.js";
+import { normalizePhoneNumber } from "./identifiers.js";
 export async function createApp(config, storeOverride, scheduleBackground) {
     const store = storeOverride || new PrismaStore(config.databaseUrl, config.databaseSsl, config.mockMode, config.initialAdminPassword);
     await store.init();
@@ -21,7 +23,8 @@ export async function createApp(config, storeOverride, scheduleBackground) {
     const nimbus = new NimbusClient({ apiUrl: config.nimbusApiUrl, apiKey: config.nimbusApiKey, apiSecret: config.nimbusApiSecret, maxPages: config.maxLookupPages, mockMode: config.mockMode }, { getOrderId: (order) => store.getOrderId(order), cacheOrder: (order, id) => store.cacheOrder(order, id) });
     const shopify = new ShopifyClient({ storeDomain: config.shopifyStoreDomain || "", clientId: config.shopifyClientId || "", clientSecret: config.shopifyClientSecret || "", accessToken: config.shopifyAccessToken, apiVersion: config.shopifyApiVersion, mockMode: config.mockMode });
     const whatsapp = new WhatsAppClient({ provider: config.whatsappProvider || "disabled", accessToken: config.whatsappAccessToken || "", phoneNumberId: config.whatsappPhoneNumberId, verifyToken: config.whatsappVerifyToken, appSecret: config.whatsappAppSecret, apiUrl: config.whatsappApiUrl, serviceApiUrl: config.whatsappServiceApiUrl, sender: config.whatsappSender, campaignId: config.whatsappCampaignId, templateName: config.whatsappTemplateName, templateLanguage: config.whatsappTemplateLanguage, mockMode: config.mockMode });
-    const whatsappRouter = new WhatsAppRouter({ store, shopify, nimbus, whatsapp, supportPhone: config.supportPhone || "" });
+    const ai = createAiOrchestrator({ geminiApiKey: config.geminiApiKey, geminiModel: config.geminiModel, claudeApiKey: config.claudeApiKey, claudeModel: config.claudeModel, openaiApiKey: config.openaiApiKey, openaiModel: config.openaiModel, primaryProvider: config.aiPrimaryProvider });
+    const whatsappRouter = new WhatsAppRouter({ store, shopify, nimbus, whatsapp, supportPhone: config.supportPhone || "", ai, aiMaxTurns: config.aiMaxTurns, brainFilePath: config.brainFilePath, escalationPhone: config.escalationPhone });
     const allowedOrigins = new Set([
         "http://localhost:5173",
         "https://auto-ship-client.vercel.app",
@@ -266,7 +269,7 @@ export async function createApp(config, storeOverride, scheduleBackground) {
         }
     });
     app.get("/api/support/overview", authenticate, adminOnly, async (_request, response, next) => { try {
-        response.json({ ...(await store.getSupportOverview()), connections: { whatsapp: whatsapp.connected, shopify: shopify.connected, nimbus: config.mockMode || Boolean(config.nimbusApiKey && config.nimbusApiSecret) } });
+        response.json({ ...(await store.getSupportOverview()), connections: { whatsapp: whatsapp.connected, shopify: shopify.connected, nimbus: config.mockMode || Boolean(config.nimbusApiKey && config.nimbusApiSecret), ai: ai.enabled } });
     }
     catch (error) {
         next(error);
@@ -279,6 +282,25 @@ export async function createApp(config, storeOverride, scheduleBackground) {
             if (!(await store.updateSupportTicket(String(request.params.ticketId), status)))
                 return response.status(404).json({ error: "Support ticket was not found." });
             response.json({ updated: true });
+        }
+        catch (error) {
+            next(error);
+        }
+    });
+    app.post("/api/support/messages", authenticate, adminOnly, async (request, response, next) => {
+        try {
+            const rawPhone = String(request.body?.phone || "");
+            const localPhone = normalizePhoneNumber(rawPhone);
+            const phone = localPhone ? `91${localPhone}` : "";
+            const text = typeof request.body?.text === "string" ? request.body.text.trim().slice(0, 2_000) : "";
+            if (!localPhone || phone.length < 10 || phone.length > 15)
+                return response.status(400).json({ error: "A valid WhatsApp phone number is required." });
+            if (!text)
+                return response.status(400).json({ error: "Message text is required." });
+            await whatsapp.sendText(phone, text);
+            await store.addWhatsAppMessage({ phone, direction: "outbound", source: "agent", text });
+            await store.setBotPaused(phone, true, "agent_message");
+            response.status(201).json({ phone, sent: true });
         }
         catch (error) {
             next(error);
@@ -299,6 +321,7 @@ export async function createApp(config, storeOverride, scheduleBackground) {
         }
     });
     app.get("/api/settings/status", authenticate, adminOnly, (_request, response) => response.json({ connected: !config.mockMode && Boolean(config.nimbusApiKey && config.nimbusApiSecret), demoMode: config.mockMode, apiUrl: config.nimbusApiUrl, database: "PostgreSQL", support: { whatsapp: whatsapp.connected, shopify: shopify.connected } }));
+    app.get("/api/settings/ai-status", authenticate, adminOnly, (_request, response) => response.json({ enabled: ai.enabled, configuredProviders: ai.configuredProviders, primaryProvider: ai.primaryProvider || null, maxTurns: Math.max(1, config.aiMaxTurns || 3), escalationPhone: config.escalationPhone || config.supportPhone || "" }));
     app.get("/demo-labels", (_request, response) => response.type("html").send("<title>AutoShip demo labels</title><style>body{font-family:system-ui;padding:40px}code{font-size:18px}</style><h1>Demo label bundle</h1><p>Live mode returns NimbusPost’s merged PDF here.</p>"));
     const clientDist = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../client/dist");
     if (fs.existsSync(path.join(clientDist, "index.html"))) {
