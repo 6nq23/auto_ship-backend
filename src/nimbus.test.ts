@@ -17,6 +17,8 @@ describe("Nimbus courier priority", () => {
       "Bluedart Brand Air",
       "Bluedart Brand",
       "Delhivery Surface DT_Stressed",
+      "Xpressbees Surface",
+      "Xpressbees Surface_Stressed",
       "Delhivery Surface DT",
     ]);
   });
