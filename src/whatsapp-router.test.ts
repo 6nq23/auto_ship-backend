@@ -4,7 +4,7 @@ import type { ShopifyClient } from "./shopify.js";
 import type { Store } from "./store.js";
 import type { WhatsAppClient } from "./whatsapp.js";
 import { AiOrchestrator } from "./ai-providers.js";
-import type { WhatsAppMessage } from "./types.js";
+import type { SupportConversation, WhatsAppMessage } from "./types.js";
 import { WhatsAppRouter, classifyIntent, extractOrderNumber, extractPhoneNumber, parseAddress, refundCategory } from "./whatsapp-router.js";
 
 describe("WhatsApp support parsing", () => {
@@ -259,10 +259,11 @@ describe("WhatsApp support parsing", () => {
   it("reads policy guidance from brain.md and escalates exchange requests", async () => {
     const sendText = vi.fn(async () => undefined);
     const createSupportTicket = vi.fn(async () => undefined);
+    let conversation: SupportConversation | undefined;
     const ai = new AiOrchestrator([{ name: "gemini", chat: vi.fn(async () => ({ text: "", toolCalls: [{ name: "create_ticket", arguments: { reason: "Customer received the wrong item and wants an exchange", order_number: "RBD5001", category: "exchange" } }] })) }]);
     const router = new WhatsAppRouter({
       store: {
-        addWhatsAppMessage: vi.fn(async () => true), getConversation: vi.fn(async () => undefined), getConversationHistory: vi.fn(async () => []), incrementAiTurnCount: vi.fn(async () => 1), clearConversation: vi.fn(async () => undefined), createSupportTicket,
+        addWhatsAppMessage: vi.fn(async () => true), getConversation: vi.fn(async () => conversation), getConversationHistory: vi.fn(async () => []), incrementAiTurnCount: vi.fn(async () => 1), saveConversation: vi.fn(async (next: Omit<SupportConversation, "updatedAt" | "expiresAt">) => { const now = new Date(); conversation = { ...next, updatedAt: now.toISOString(), expiresAt: new Date(now.getTime() + 60_000).toISOString() }; }), clearConversation: vi.fn(async () => { conversation = undefined; }), createSupportTicket,
         withConversationLock: async (_phone: string, task: () => Promise<unknown>) => task(),
       } as unknown as Store,
       shopify: {} as ShopifyClient,
@@ -275,9 +276,16 @@ describe("WhatsApp support parsing", () => {
     });
 
     await router.handleIncomingMessage({ id: "wa-ai-exchange", phone: "919876543210", text: "I received the wrong rakhi and want an exchange" });
+    expect(createSupportTicket).not.toHaveBeenCalled();
+    expect(conversation).toEqual(expect.objectContaining({ step: "waiting_escalation_issue", context: expect.objectContaining({ category: "return", orderNumber: "#RBD5001" }) }));
+    expect(sendText.mock.calls[0]?.[0]).toBe("919876543210");
+    expect(sendText.mock.calls[0]?.[1]).toContain("keep the item");
+    expect(sendText.mock.calls[0]?.[1]).toContain("one clear line");
+
+    await router.handleIncomingMessage({ id: "wa-ai-exchange-detail", phone: "919876543210", text: "I received the wrong blue rakhi in order RBD5001." });
     expect(createSupportTicket).toHaveBeenCalledWith(expect.objectContaining({ category: "return", orderNumber: "#RBD5001" }));
-    expect(sendText.mock.calls[0]?.[0]).toBe("919924863749");
-    expect(sendText.mock.calls[1]?.[1]).toContain("keep the item");
-    expect(sendText.mock.calls[1]?.[1]).toContain("senior support team");
+    expect(sendText.mock.calls[1]?.[0]).toBe("919924863749");
+    expect(sendText.mock.calls[2]?.[0]).toBe("919876543210");
+    expect(sendText.mock.calls[2]?.[1]).toContain("exact issue");
   });
 });

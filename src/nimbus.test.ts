@@ -11,6 +11,16 @@ const makeClient = () => new NimbusClient(
 afterEach(() => vi.unstubAllGlobals());
 
 describe("Nimbus courier priority", () => {
+  it("uses the requested air-first courier order", () => {
+    expect(COURIER_PRIORITY.map((courier) => courier.name)).toEqual([
+      "Delhivery Air",
+      "Bluedart Brand Air",
+      "Bluedart Brand",
+      "Delhivery Surface DT_Stressed",
+      "Delhivery Surface DT",
+    ]);
+  });
+
   it("normalizes spaced and prefix-free customer order numbers before lookup", async () => {
     const requested: string[] = [];
     vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {

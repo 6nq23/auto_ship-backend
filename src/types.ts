@@ -46,7 +46,7 @@ export type OrderMatch = {
 };
 
 export type SupportIntent = "confirm_order" | "change_address" | "order_status" | "not_dispatched" | "order_failed" | "refund_return";
-export type ConversationStep = "ai_active" | "waiting_menu" | "waiting_issue" | "waiting_order" | "waiting_pick" | "waiting_address" | "waiting_phone" | "waiting_confirm" | "waiting_ndr_choice";
+export type ConversationStep = "ai_active" | "waiting_menu" | "waiting_issue" | "waiting_order" | "waiting_pick" | "waiting_address" | "waiting_phone" | "waiting_confirm" | "waiting_ndr_choice" | "waiting_escalation_issue";
 export type SupportConversation = {
   phone: string;
   intent?: SupportIntent;

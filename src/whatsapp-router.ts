@@ -22,7 +22,7 @@ const KEYWORDS: Array<[SupportIntent, RegExp]> = [
   ["not_dispatched", /\b(not dispatch|dispatch nahi|not ship|ship nahi|kab bhejoge|nahi bheja|why not shipped)\b/i],
   ["change_address", /\b(address|phone|number)\b.*\b(change|update|badlo|galat|wrong)\b|\b(change|update|badlo|galat|wrong)\b.*\b(address|phone|number)\b/i],
   ["order_status", /\b(status|tracking|track|kaha hai|where|kab aayega|kab milega|kidhar)\b/i],
-  ["confirm_order", /\b(confirm|pakka|order confirm|mera order aaya|placed|order hua)\b/i],
+  ["confirm_order", /\b(confirm|pakka|order confirm|mera order aaya|placed|order hua|payment|paid|prepaid|cod)\b/i],
 ];
 
 export const classifyIntent = (text: string): SupportIntent | undefined => {
@@ -106,10 +106,13 @@ export class WhatsAppRouter {
     if (response.escalate) {
       const customerText = messages.filter((item) => item.role === "user").map((item) => item.content).join("\n");
       const category = refundCategory(customerText);
-      return this.escalateToHuman(phone, response.text || "AI requested human support", category, extractOrderNumber(customerText), response.text);
+      const reason = response.text || "Customer requested senior support";
+      return category === "other"
+        ? this.escalateToHuman(phone, reason, category, extractOrderNumber(customerText), response.text)
+        : this.beginEscalation(phone, reason, category, extractOrderNumber(customerText), response.text);
     }
     if (!response.text) throw new Error("AI returned neither a reply nor a tool call");
-    if (!response.resolved && turnCount >= Math.max(1, this.dependencies.aiMaxTurns || 3)) return this.escalateToHuman(phone, "The AI agent could not resolve the conversation within the configured turn limit", "other");
+    if (!response.resolved && turnCount >= Math.max(1, this.dependencies.aiMaxTurns || 3)) return this.escalateToHuman(phone, "The automated conversation could not be resolved within the configured turn limit", "other");
     if (response.resolved) await this.dependencies.store.clearConversation(phone);
     await this.send(phone, response.text, undefined, undefined, response.provider);
   }
@@ -132,7 +135,10 @@ export class WhatsAppRouter {
       const inferredCategory = refundCategory(`${String(args.category || "")} ${reason} ${customerMessage || ""}`);
       const category = isTicketCategory(args.category) && args.category !== "other" ? args.category : inferredCategory;
       const rawOrderNumber = String(args.order_number || args.order_id || args.orderId || "");
-      return this.escalateToHuman(phone, reason, category, extractOrderNumber(rawOrderNumber), customerMessage);
+      const orderNumber = extractOrderNumber(rawOrderNumber);
+      return category === "other"
+        ? this.escalateToHuman(phone, reason, category, orderNumber, customerMessage)
+        : this.beginEscalation(phone, reason, category, orderNumber, customerMessage);
     }
     throw new Error(`Unsupported AI tool: ${toolCall.name}`);
   }
@@ -155,6 +161,14 @@ export class WhatsAppRouter {
       .replace(/^\s*[-*]\s+/gm, "• ")
       .trim();
     return content || DEFAULT_POLICY_GUIDANCE;
+  }
+
+  private async beginEscalation(phone: string, reason: string, category: SupportTicket["category"], orderNumber?: string, customerMessage?: string) {
+    const policy = await this.loadSupportPolicy();
+    await this.save({ phone, intent: "refund_return", step: "waiting_escalation_issue", context: { reason: reason.slice(0, 1_500), category, ...(orderNumber ? { orderNumber } : {}) } });
+    const empathy = escalationEmpathy(category);
+    const prompt = "I’m sending this to our senior support team so the right person can help you. Before I forward it, please reply with your main issue in one clear line—for example: ‘One rakhi is missing from order RBD1234.’ This will help the team act faster.";
+    await this.send(phone, [empathy, policy, prompt].filter(Boolean).join("\n\n"), "refund_return", orderNumber);
   }
 
   private async escalateToHuman(phone: string, reason: string, category: SupportTicket["category"], orderNumber?: string, customerMessage?: string) {
@@ -180,6 +194,14 @@ export class WhatsAppRouter {
       const ticketCategory = refundCategory(text) !== "other" ? refundCategory(text) : text.trim() === "1" ? "refund" : text.trim() === "2" ? "return" : text.trim() === "3" ? "missing" : undefined;
       if (!ticketCategory) return this.send(phone, "Reply 1 for refund, 2 for return/wrong item, or 3 for a missing item.", intent);
       return this.askForOrder(phone, intent, { ticketCategory });
+    }
+    if (step === "waiting_escalation_issue" && intent === "refund_return") {
+      const issue = text.trim().replace(/\s+/g, " ").slice(0, 1_000);
+      if (issue.length < 5) return this.send(phone, "Please describe the main issue in one short, clear line so I can send the right details to the senior team.", intent, String(context.orderNumber || "") || undefined);
+      const category = isTicketCategory(context.category) ? context.category : refundCategory(issue);
+      const orderNumber = typeof context.orderNumber === "string" ? context.orderNumber : extractOrderNumber(issue);
+      const originalReason = String(context.reason || "Customer requested senior support");
+      return this.escalateToHuman(phone, `${originalReason}\nCustomer's one-line issue: ${issue}`, category, orderNumber, "Thank you—that explains it clearly. I’ve added your exact issue to the request.");
     }
     if (step === "waiting_order" && intent) {
       const identifier = extractOrderNumber(text) || extractPhoneNumber(text);
@@ -304,7 +326,7 @@ export class WhatsAppRouter {
     if (!awb) {
       const status = order?.order_status || shopifyOrder?.displayFulfillmentStatus || "being processed";
       await this.dependencies.store.clearConversation(phone);
-      return this.send(phone, `📦 ${orderNumber} is ${humanStatus(status)}. Tracking will appear after courier booking.`, "order_status", orderNumber);
+      return this.send(phone, `I understand it’s frustrating to wait without a clear update. I checked ${orderNumber} for you—it is currently ${humanStatus(status)} and has not been handed to the courier yet. Tracking will appear as soon as the courier booking is completed. 📦`, "order_status", orderNumber);
     }
     const tracking = await this.dependencies.nimbus.track(awb).catch((error) => { console.error(`[support:${phone}] Nimbus tracking lookup failed; using available shipment data`, error); return null; });
     const status = tracking?.latest?.shipStatus || tracking?.orderStatus || order?.order_status || shopifyOrder?.displayFulfillmentStatus || "processing";
@@ -312,7 +334,7 @@ export class WhatsAppRouter {
     const eta = tracking?.shipment?.edd ? `\n📅 Expected delivery: ${formatDate(tracking.shipment.edd)}` : "";
     const trackingLink = shopifyTracking?.url ? `\n🔗 Track shipment: ${shopifyTracking.url}` : "";
     await this.dependencies.store.clearConversation(phone);
-    await this.send(phone, `${statusEmoji(status)} ${humanStatus(status)}${location}${eta}\n🚚 ${tracking?.shipment?.courierName || order?.shipment?.courier_name || shopifyTracking?.company || "Courier"}\n🔎 AWB: ${awb}${trackingLink}`, "order_status", orderNumber);
+    await this.send(phone, `I checked ${orderNumber} for you. Here’s the latest update:\n\n${statusEmoji(status)} ${humanStatus(status)}${location}${eta}\n🚚 ${tracking?.shipment?.courierName || order?.shipment?.courier_name || shopifyTracking?.company || "Courier"}\n🔎 AWB: ${awb}${trackingLink}`, "order_status", orderNumber);
   }
 
   private async notDispatched(phone: string, orderNumber: string, shopifyOrder?: ShopifyOrder, resolvedNimbusOrder?: OrderMatch) {
@@ -321,20 +343,20 @@ export class WhatsAppRouter {
       throw error;
     });
     await this.dependencies.store.clearConversation(phone);
-    if (!order) return this.send(phone, `Your order ${orderNumber} is being processed by our team and should be prepared within 24–48 hours. We'll share tracking once dispatched. 📦`, "not_dispatched", orderNumber);
+    if (!order) return this.send(phone, `I’m sorry this is taking longer than expected. I checked ${orderNumber}; it is still being prepared and has not been dispatched yet. We’ll share the tracking details as soon as it is handed to the courier. 📦`, "not_dispatched", orderNumber);
     const status = (order.order_status || "created").toLowerCase();
     if (order.shipment?.awb || shopifyOrder?.trackingInfo?.some((item) => item.number) || /shipped|transit|picked/.test(status)) return this.orderStatus(phone, orderNumber, shopifyOrder, order);
-    const response = status === "booked" ? `Your order is booked with ${order.shipment?.courier_name || "the courier"}. Pickup is scheduled.` : status === "created" ? "Your order is ready and queued for shipping. Courier pickup should happen today or tomorrow. 🚛" : `Your order is currently ${status}. We'll share tracking after dispatch.`;
+    const response = status === "booked" ? `I understand the delay is frustrating. ${orderNumber} is booked with ${order.shipment?.courier_name || "the courier"}, and pickup is scheduled.` : status === "created" ? `I’m sorry you’ve had to wait. ${orderNumber} is ready and queued for courier pickup. We’ll send the tracking details as soon as it is collected. 🚛` : `I checked ${orderNumber}; it is currently ${humanStatus(status)}. I know you’re waiting, and we’ll share tracking as soon as it is dispatched.`;
     await this.send(phone, response, "not_dispatched", orderNumber);
   }
 
   private async refundReturn(phone: string, order: ShopifyOrder, category: SupportTicket["category"] = "other") {
     const details = `We found ${order.name}: ${order.lineItems.map((item) => `${item.title} ×${item.quantity}`).join(", ")} · ${formatMoney(order)}.`;
-    await this.escalateToHuman(phone, `Refund, return, exchange, missing, or wrong-item request received on WhatsApp. ${details}`, category, order.name);
+    await this.beginEscalation(phone, `Refund, return, exchange, missing, or wrong-item request received on WhatsApp. ${details}`, category, order.name);
   }
 
   private async refundNimbusOrder(phone: string, order: OrderMatch, category: SupportTicket["category"] = "other") {
-    await this.escalateToHuman(phone, "Refund, return, exchange, missing, or wrong-item request received on WhatsApp for a NimbusPost order", category, order.order_number);
+    await this.beginEscalation(phone, "Refund, return, exchange, missing, or wrong-item request received on WhatsApp for a NimbusPost order", category, order.order_number);
   }
 
   private async beginAddressChange(phone: string, shopifyOrder: ShopifyOrder) {
@@ -467,6 +489,11 @@ const isSupportIntent = (value: unknown): value is SupportIntent => typeof value
 const isTicketCategory = (value: unknown): value is SupportTicket["category"] => typeof value === "string" && ["refund", "return", "missing", "other"].includes(value);
 const DEFAULT_BRAIN = "You are AutoShip support. Return JSON with text, toolCalls, resolved, and escalate. Never invent order facts; use a tool for every order question.";
 const DEFAULT_POLICY_GUIDANCE = "Our team will review your refund, return, exchange, or missing-item request according to the store policy. Please keep the item and packaging safe until our senior support team confirms the next step.";
+const escalationEmpathy = (category: SupportTicket["category"]) => category === "missing"
+  ? "I’m really sorry an item is missing from your order. I understand how disappointing that is."
+  : category === "refund"
+    ? "I understand you want this refund request handled properly, and I’ll make sure the right team reviews it."
+    : "I’m sorry the order wasn’t right. I’ll help you get this reviewed for a return or exchange.";
 const formatDate = (value: string) => new Date(value).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" });
 const statusEmoji = (status: string) => /delivered/i.test(status) ? "✅" : /out for delivery/i.test(status) ? "🎉" : /ndr|fail/i.test(status) ? "⚠️" : /rto|return/i.test(status) ? "↩️" : "🚚";
 const humanStatus = (status: string) => status.replace(/\b\w/g, (letter) => letter.toUpperCase());

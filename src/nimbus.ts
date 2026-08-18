@@ -8,13 +8,11 @@ const isPickupRecoveryStatus = (status?: string) => ["pickup_scheduled", "pickup
 const isPickupRecoveryWarning = (item: ShippedOrder) => ["PICKUP_ALREADY_SCHEDULED", "PICKUP_ALREADY_PENDING"].includes(item.warningCode || "");
 
 export const COURIER_PRIORITY = [
-  { roleId: "6a61a64916956018f71a27d3", courierId: "6a0d96ef27ad772d357b22cc", name: "Delhivery Surface DT" },
-  { roleId: "6a61a64916956018f71a27d7", courierId: "6a06d0daea73ccc9fd278986", name: "Bluedart Brand" },
-  { roleId: "6a61a64916956018f71a27d5", courierId: "6a0d96ef27ad772d357b230a", name: "Delhivery Surface DT_Stressed" },
-  { roleId: "6a61a64916956018f71a27d9", courierId: "6a0d96ef27ad772d357b22b7", name: "Xpressbees Surface" },
-  { roleId: "6a61a64916956018f71a27db", courierId: "6a0d96ef27ad772d357b2308", name: "Xpressbees Surface_Stressed" },
   { roleId: "6a61a64916956018f71a27d1", courierId: "6a0d96ef27ad772d357b22b4", name: "Delhivery Air" },
   { roleId: "6a61a64916956018f71a27cf", courierId: "6a06d0daea73ccc9fd278979", name: "Bluedart Brand Air" },
+  { roleId: "6a61a64916956018f71a27d7", courierId: "6a06d0daea73ccc9fd278986", name: "Bluedart Brand" },
+  { roleId: "6a61a64916956018f71a27d5", courierId: "6a0d96ef27ad772d357b230a", name: "Delhivery Surface DT_Stressed" },
+  { roleId: "6a61a64916956018f71a27d3", courierId: "6a0d96ef27ad772d357b22cc", name: "Delhivery Surface DT" },
 ] as const;
 
 export class NimbusClient {
