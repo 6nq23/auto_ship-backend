@@ -45,8 +45,8 @@ export type OrderMatch = {
   shipment?: { awb?: string; courier_name?: string; price?: { total?: number }; amount?: number; label_url?: string };
 };
 
-export type SupportIntent = "confirm_order" | "change_address" | "order_status" | "not_dispatched" | "order_failed" | "refund_return";
-export type ConversationStep = "ai_active" | "waiting_menu" | "waiting_issue" | "waiting_order" | "waiting_pick" | "waiting_address" | "waiting_phone" | "waiting_confirm" | "waiting_ndr_choice" | "waiting_escalation_issue";
+export type SupportIntent = "confirm_order" | "change_address" | "order_status" | "not_dispatched" | "order_failed" | "refund_return" | "product_inquiry" | "additional_purchase" | "real_picture_request" | "contact_request";
+export type ConversationStep = "ai_active" | "waiting_menu" | "waiting_issue" | "waiting_order" | "waiting_pick" | "waiting_address" | "waiting_phone" | "waiting_confirm" | "waiting_ndr_choice" | "waiting_escalation_issue" | "waiting_contact_issue";
 export type SupportConversation = {
   phone: string;
   intent?: SupportIntent;
@@ -65,22 +65,29 @@ export type WhatsAppMessage = {
   providerMessageId?: string;
   aiProvider?: AiProviderName;
   source?: "customer" | "bot" | "agent";
+  messageType?: "text" | "image";
   createdAt: string;
 };
+export type CustomerIssueMemory = { intent?: SupportIntent; orderNumber?: string; summary: string; status: "active" | "resolved"; updatedAt: string };
+export type CustomerMemory = { phone: string; customerName?: string; nameSource?: "shopify" | "whatsapp"; shopifyCustomerId?: string; summary: string; currentIssue?: string; knownOrderNumbers: string[]; issueHistory: CustomerIssueMemory[]; archiveSummary?: string; archivedThroughMessageId?: string; profile: Record<string, unknown>; lastIntent?: SupportIntent; lastOrderNumber?: string; activeTicketId?: string; updatedAt: string };
+export type CustomerChatContext = { version: 1; phone: string; customer: CustomerMemory; messages: WhatsAppMessage[]; tickets: SupportTicket[]; generatedAt: string };
 export type BotPause = { phone: string; pausedAt: string; expiresAt: string; reason: "manual" | "agent_message" };
-export type SupportTicketStatus = "open" | "resolved";
+export type SupportTicketStatus = "awaiting_email" | "open" | "resolved";
 export type SupportTicket = {
   ticketId: string;
   phone: string;
   orderNumber?: string;
-  category: "refund" | "return" | "missing" | "other";
+  category: "refund" | "return" | "missing" | "address_change" | "contact_request" | "other";
   description?: string;
+  metadata?: Record<string, unknown>;
   status: SupportTicketStatus;
   createdAt: string;
+  updatedAt?: string;
   resolvedAt?: string;
 };
 export type SupportOverview = {
   messages: WhatsAppMessage[];
+  customers: CustomerMemory[];
   tickets: SupportTicket[];
   conversations: SupportConversation[];
   botPauses: BotPause[];
@@ -95,6 +102,8 @@ export type AiResponse = {
   toolCalls?: AiToolCall[];
   resolved?: boolean;
   escalate?: boolean;
+  intent?: SupportIntent;
+  summary?: string;
   provider?: AiProviderName;
 };
 
@@ -115,6 +124,8 @@ export type ShopifyAddress = {
 export type ShopifyOrder = {
   id: string;
   name: string;
+  shopifyCustomerId?: string;
+  customerName?: string;
   createdAt: string;
   displayFinancialStatus?: string;
   displayFulfillmentStatus?: string;

@@ -3,7 +3,7 @@ import request from "supertest";
 import { describe, expect, it } from "vitest";
 import { createApp } from "./app.js";
 import type { Store } from "./store.js";
-import type { Batch, BotPause, ShippingJob, SupportConversation, SupportOverview, SupportTicket, SupportTicketStatus, UserRecord, WhatsAppMessage } from "./types.js";
+import type { Batch, BotPause, CustomerMemory, ShippingJob, SupportConversation, SupportOverview, SupportTicket, SupportTicketStatus, UserRecord, WhatsAppMessage } from "./types.js";
 
 class MemoryStore implements Store {
   private users: UserRecord[] = [];
@@ -14,6 +14,7 @@ class MemoryStore implements Store {
   private conversations = new Map<string, SupportConversation>();
   private tickets = new Map<string, SupportTicket>();
   private botPauses = new Map<string, BotPause>();
+  private memories = new Map<string, CustomerMemory>();
   async init() { this.users = [{ id: 1, username: "admin", passwordHash: await bcrypt.hash("admin123", 4), role: "admin" }]; }
   async findUser(username: string) { return this.users.find((user) => user.username.toLowerCase() === username.toLowerCase()); }
   async createUser(username: string, passwordHash: string, role: UserRecord["role"]) {
@@ -33,6 +34,11 @@ class MemoryStore implements Store {
   async withConversationLock<T>(_phone: string, task: () => Promise<T>) { return task(); }
   async addWhatsAppMessage(message: Omit<WhatsAppMessage, "id" | "createdAt">) { if (message.providerMessageId && this.messages.some((item) => item.providerMessageId === message.providerMessageId)) return false; this.messages.unshift({ ...message, id: String(this.messages.length + 1), createdAt: new Date().toISOString() }); return true; }
   async getConversationHistory(phone: string, limit: number) { return this.messages.filter((message) => message.phone === phone).slice(0, limit).reverse(); }
+  async getCompleteConversationHistory(phone: string) { return structuredClone(this.messages.filter((message) => message.phone === phone)); }
+  async getCustomerMemory(phone: string) { const memory = this.memories.get(phone); return memory ? structuredClone(memory) : undefined; }
+  async saveCustomerMemory(memory: Omit<CustomerMemory, "updatedAt">) { this.memories.set(memory.phone, { ...structuredClone(memory), updatedAt: new Date().toISOString() }); }
+  async getCustomerMemories() { return structuredClone([...this.memories.values()]); }
+  async getCustomerChatContext(phone: string) { return { version: 1 as const, phone, customer: structuredClone(this.memories.get(phone) || { phone, summary: "", knownOrderNumbers: [], issueHistory: [], profile: {}, updatedAt: new Date(0).toISOString() }), messages: await this.getCompleteConversationHistory(phone), tickets: structuredClone([...this.tickets.values()].filter((ticket) => ticket.phone === phone)), generatedAt: new Date().toISOString() }; }
   async incrementAiTurnCount(phone: string) { const next = await this.getAiTurnCount(phone) + 1; await this.saveConversation({ phone, step: "ai_active", context: { aiTurnCount: next } }); return next; }
   async getAiTurnCount(phone: string) { const conversation = await this.getConversation(phone); return conversation?.step === "ai_active" ? Number(conversation.context.aiTurnCount || 0) : 0; }
   async getConversation(phone: string) { const conversation = this.conversations.get(phone); return conversation ? structuredClone(conversation) : undefined; }
@@ -42,8 +48,10 @@ class MemoryStore implements Store {
   async setBotPaused(phone: string, paused: boolean, reason: BotPause["reason"] = "manual") { if (!paused) { this.botPauses.delete(phone); return; } const now = new Date(); this.botPauses.set(phone, { phone, reason, pausedAt: now.toISOString(), expiresAt: new Date(now.getTime() + 24 * 60 * 60_000).toISOString() }); this.conversations.delete(phone); }
   async isRecentBotMessage(phone: string, text: string) { return this.messages.some((message) => message.phone === phone && message.direction === "outbound" && message.source !== "agent" && message.text === text); }
   async createSupportTicket(ticket: SupportTicket) { this.tickets.set(ticket.ticketId, structuredClone(ticket)); }
+  async findOpenSupportTicket(phone: string, category: SupportTicket["category"], orderNumber?: string) { return [...this.tickets.values()].find((ticket) => ticket.phone === phone && ticket.category === category && ticket.status !== "resolved" && (!orderNumber || !ticket.orderNumber || ticket.orderNumber === orderNumber)); }
+  async updateSupportTicketDetails(ticketId: string, updates: { orderNumber?: string; description?: string; metadata?: Record<string, unknown>; status?: SupportTicketStatus }) { const ticket = this.tickets.get(ticketId); if (!ticket) return false; Object.assign(ticket, updates, { metadata: { ...(ticket.metadata || {}), ...(updates.metadata || {}) }, updatedAt: new Date().toISOString() }); return true; }
   async updateSupportTicket(ticketId: string, status: SupportTicketStatus) { const ticket = this.tickets.get(ticketId); if (!ticket) return false; ticket.status = status; ticket.resolvedAt = status === "resolved" ? new Date().toISOString() : undefined; return true; }
-  async getSupportOverview(): Promise<SupportOverview> { return { messages: structuredClone(this.messages), tickets: structuredClone([...this.tickets.values()]), conversations: structuredClone([...this.conversations.values()]), botPauses: structuredClone([...this.botPauses.values()]), stats: { inboundToday: this.messages.filter((message) => message.direction === "inbound").length, outboundToday: this.messages.filter((message) => message.direction === "outbound").length, activeConversations: this.conversations.size, openTickets: [...this.tickets.values()].filter((ticket) => ticket.status === "open").length } }; }
+  async getSupportOverview(): Promise<SupportOverview> { return { messages: structuredClone(this.messages), customers: await this.getCustomerMemories(), tickets: structuredClone([...this.tickets.values()]), conversations: structuredClone([...this.conversations.values()]), botPauses: structuredClone([...this.botPauses.values()]), stats: { inboundToday: this.messages.filter((message) => message.direction === "inbound").length, outboundToday: this.messages.filter((message) => message.direction === "outbound").length, activeConversations: this.conversations.size, openTickets: [...this.tickets.values()].filter((ticket) => ticket.status !== "resolved").length } }; }
 }
 
 const config = {
@@ -84,13 +92,25 @@ describe("AutoShip API", () => {
     const token = await login(app);
     let overview: SupportOverview | undefined;
     for (let attempt = 0; attempt < 20; attempt++) { overview = (await request(app).get("/api/support/overview").set("Authorization", `Bearer ${token}`)).body; if (overview?.stats.outboundToday) break; await new Promise((resolve) => setTimeout(resolve, 10)); }
-    expect(overview?.stats.inboundToday).toBe(1); expect(overview?.stats.outboundToday).toBe(1); expect(overview?.conversations[0].step).toBe("waiting_menu");
+    expect(overview?.stats.inboundToday).toBe(1); expect(overview?.stats.outboundToday).toBe(1); expect(overview?.conversations).toEqual([]); expect(overview?.messages[0].text).toContain("please tell me what you need help with");
   });
   it("asks for a refund/return/missing subtype before collecting an order", async () => {
     const app = await makeApp(); const token = await login(app);
     expect((await request(app).post("/api/whatsapp/webhook").send({ id: "message-refund-menu", from: "919876543210", text: "6" })).status).toBe(200);
     const overview = await request(app).get("/api/support/overview").set("Authorization", `Bearer ${token}`);
     expect(overview.body.conversations).toEqual([expect.objectContaining({ phone: "919876543210", intent: "refund_return", step: "waiting_issue" })]);
+  });
+  it("records refund and missing-item requests as awaiting customer email without duplicate tickets", async () => {
+    const app = await makeApp(); const token = await login(app);
+    await request(app).post("/api/whatsapp/webhook").send({ id: "missing-1", from: "919876543210", text: "One rakhi is missing from RBD5001" });
+    await request(app).post("/api/whatsapp/webhook").send({ id: "missing-2", from: "919876543210", text: "missing product from RBD5001" });
+    await request(app).post("/api/whatsapp/webhook").send({ id: "refund-1", from: "919876543210", text: "I need refund for RBD5001" });
+    let overview: SupportOverview | undefined;
+    for (let attempt = 0; attempt < 20; attempt++) { overview = (await request(app).get("/api/support/overview").set("Authorization", `Bearer ${token}`)).body; if (overview?.tickets.length === 2) break; await new Promise((resolve) => setTimeout(resolve, 10)); }
+    expect(overview?.tickets).toEqual(expect.arrayContaining([expect.objectContaining({ category: "missing", status: "awaiting_email", orderNumber: "#RBD5001", metadata: expect.objectContaining({ customerName: "Demo Customer" }) }), expect.objectContaining({ category: "refund", status: "awaiting_email", orderNumber: "#RBD5001" })]));
+    expect(overview?.tickets.filter((ticket) => ticket.category === "missing")).toHaveLength(1);
+    const replies = overview?.messages.filter((message) => message.direction === "outbound").map((message) => message.text).join("\n") || "";
+    expect(replies).toContain("support@diorin.com"); expect(replies).toContain("every product you received"); expect(replies).toContain("exact Rakhi/product name and quantity");
   });
   it("restricts the support dashboard and ticket updates to admins", async () => {
     const app = await makeApp();

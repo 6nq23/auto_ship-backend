@@ -18,6 +18,8 @@ export function loadConfig(): AppConfig {
   const requestedAiProvider = process.env.AI_PRIMARY_PROVIDER || "gemini";
   const aiPrimaryProvider = (["gemini", "claude", "openai"].includes(requestedAiProvider) ? requestedAiProvider : "gemini") as AiProviderName;
   const requestedAiMaxTurns = Number(process.env.AI_MAX_TURNS || 3);
+  const requestedMaxConcurrentChats = Number(process.env.BOT_MAX_CONCURRENT_CHATS || 1);
+  const requestedAiContextMaxChars = Number(process.env.AI_CONTEXT_MAX_CHARS || 120_000);
   const backendDirectory = process.env.VERCEL || path.basename(workspaceDirectory).toLowerCase() === "auto_ship-backend" ? workspaceDirectory : path.join(workspaceDirectory, "server");
 
   if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL is required. Copy .env.example to .env and set your PostgreSQL connection string.");
@@ -60,6 +62,8 @@ export function loadConfig(): AppConfig {
     openaiModel: process.env.OPENAI_MODEL,
     aiPrimaryProvider,
     aiMaxTurns: Number.isFinite(requestedAiMaxTurns) ? Math.max(1, Math.trunc(requestedAiMaxTurns)) : 3,
+    maxConcurrentChats: Number.isFinite(requestedMaxConcurrentChats) ? Math.max(1, Math.trunc(requestedMaxConcurrentChats)) : 1,
+    aiContextMaxChars: Number.isFinite(requestedAiContextMaxChars) ? Math.max(10_000, Math.min(800_000, Math.trunc(requestedAiContextMaxChars))) : 120_000,
     brainFilePath: process.env.BRAIN_FILE_PATH || path.join(backendDirectory, "data", "brain.md"),
     escalationPhone: process.env.ESCALATION_PHONE || process.env.SUPPORT_PHONE_NUMBER || process.env.Phonenumber || "919924863749",
   };

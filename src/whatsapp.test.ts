@@ -51,6 +51,11 @@ describe("WhatsApp webhook authentication", () => {
 });
 
 describe("Getgabs WhatsApp integration", () => {
+  it("keeps the WhatsApp profile name for customer memory", () => {
+    const client = new WhatsAppClient({ provider: "getgabs", accessToken: "key", mockMode: false });
+    expect(client.extractMessages({ message_id: "named", message_from: "9876543210", message_text: "hello", profile_name: "Asha Shah", direction: "inbound" })).toEqual([{ id: "named", phone: "9876543210", text: "hello", messageType: "text", customerName: "Asha Shah" }]);
+  });
+
   it("extracts normal text and quick-reply button webhooks", () => {
     const client = new WhatsAppClient({ provider: "getgabs", accessToken: "key", mockMode: false });
 
@@ -60,7 +65,7 @@ describe("Getgabs WhatsApp integration", () => {
       message_text: "3",
       message_type: "text",
       direction: "inbound",
-    })).toEqual([{ id: "wamid.text", phone: "919876543210", text: "3" }]);
+    })).toEqual([{ id: "wamid.text", phone: "919876543210", text: "3", messageType: "text" }]);
 
     expect(client.extractMessages({
       message_id: "wamid.button",
@@ -68,7 +73,7 @@ describe("Getgabs WhatsApp integration", () => {
       message_text: JSON.stringify({ type: "button", button: { payload: "5", text: "Delivery failed" } }),
       message_type: "button",
       direction: "inbound",
-    })).toEqual([{ id: "wamid.button", phone: "919876543210", text: "5" }]);
+    })).toEqual([{ id: "wamid.button", phone: "919876543210", text: "5", messageType: "text" }]);
   });
 
   it("separates manual outbound agent messages from customer messages", () => {

@@ -19,6 +19,30 @@ describe("AI provider orchestration", () => {
     expect(parseAiResponse("plain reply")).toEqual({ text: "plain reply", resolved: false });
   });
 
+  it("reads Claude's reply past the leading thinking block and surfaces refusals", async () => {
+    const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      expect(String(url)).toBe("https://api.anthropic.com/v1/messages");
+      expect(init?.headers).toEqual(expect.objectContaining({ "x-api-key": "test-key", "anthropic-version": "2023-06-01" }));
+      expect(JSON.parse(String(init?.body)).model).toBe("claude-opus-5");
+      return new Response(JSON.stringify({
+        stop_reason: "end_turn",
+        content: [{ type: "thinking", thinking: "" }, { type: "text", text: "{\"text\":\"Hello\",\"resolved\":true}" }],
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const ai = createAiOrchestrator({ claudeApiKey: "test-key", primaryProvider: "claude" });
+      await expect(ai.chat([{ role: "user", content: "Hello" }], "rules")).resolves.toEqual(expect.objectContaining({ provider: "claude", text: "Hello", resolved: true }));
+    } finally { vi.unstubAllGlobals(); }
+
+    const refusalMock = vi.fn(async () => new Response(JSON.stringify({ stop_reason: "refusal", content: [] }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    vi.stubGlobal("fetch", refusalMock);
+    try {
+      const ai = createAiOrchestrator({ claudeApiKey: "test-key", primaryProvider: "claude" });
+      await expect(ai.chat([{ role: "user", content: "Hello" }], "rules")).rejects.toThrow(/All configured AI providers failed/);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
   it("uses the available Gemini 2.5 Flash default and the API-key header", async () => {
     const fetchMock = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       expect(String(url)).toContain("/models/gemini-2.5-flash:generateContent");

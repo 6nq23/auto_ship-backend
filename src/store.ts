@@ -1,7 +1,7 @@
 import bcrypt from "bcryptjs";
 import type { Prisma, PrismaClient } from "@prisma/client";
 import { getPrisma } from "./db.js";
-import type { Batch, BotPause, Role, ShippingJob, SupportConversation, SupportIntent, SupportOverview, SupportTicket, SupportTicketStatus, UserRecord, WhatsAppMessage } from "./types.js";
+import type { Batch, BotPause, CustomerChatContext, CustomerMemory, Role, ShippingJob, SupportConversation, SupportIntent, SupportOverview, SupportTicket, SupportTicketStatus, UserRecord, WhatsAppMessage } from "./types.js";
 
 export interface Store {
   init(): Promise<void>;
@@ -20,8 +20,12 @@ export interface Store {
   withConversationLock<T>(phone: string, task: () => Promise<T>): Promise<T>;
   addWhatsAppMessage(message: Omit<WhatsAppMessage, "id" | "createdAt">): Promise<boolean>;
   getConversationHistory(phone: string, limit: number): Promise<WhatsAppMessage[]>;
+  getCompleteConversationHistory(phone: string): Promise<WhatsAppMessage[]>;
+  getCustomerMemory(phone: string): Promise<CustomerMemory | undefined>;
+  getCustomerMemories(): Promise<CustomerMemory[]>;
+  getCustomerChatContext(phone: string): Promise<CustomerChatContext>;
+  saveCustomerMemory(memory: Omit<CustomerMemory, "updatedAt">): Promise<void>;
   incrementAiTurnCount(phone: string): Promise<number>;
-  getAiTurnCount(phone: string): Promise<number>;
   getConversation(phone: string): Promise<SupportConversation | undefined>;
   saveConversation(conversation: Omit<SupportConversation, "updatedAt" | "expiresAt">): Promise<void>;
   clearConversation(phone: string): Promise<void>;
@@ -29,6 +33,8 @@ export interface Store {
   setBotPaused(phone: string, paused: boolean, reason?: BotPause["reason"]): Promise<void>;
   isRecentBotMessage(phone: string, text: string): Promise<boolean>;
   createSupportTicket(ticket: SupportTicket): Promise<void>;
+  findOpenSupportTicket(phone: string, category: SupportTicket["category"], orderNumber?: string): Promise<SupportTicket | undefined>;
+  updateSupportTicketDetails(ticketId: string, updates: { orderNumber?: string; description?: string; metadata?: Record<string, unknown>; status?: SupportTicketStatus }): Promise<boolean>;
   updateSupportTicket(ticketId: string, status: SupportTicketStatus): Promise<boolean>;
   getSupportOverview(): Promise<SupportOverview>;
 }
@@ -99,6 +105,7 @@ export class PrismaStore implements Store {
       );
       ALTER TABLE wa_messages ADD COLUMN IF NOT EXISTS sender_type TEXT NOT NULL DEFAULT 'bot';
       ALTER TABLE wa_messages ADD COLUMN IF NOT EXISTS ai_provider TEXT;
+      ALTER TABLE wa_messages ADD COLUMN IF NOT EXISTS message_type TEXT NOT NULL DEFAULT 'text';
       UPDATE wa_messages SET sender_type = 'customer' WHERE direction = 'inbound' AND sender_type = 'bot';
       CREATE UNIQUE INDEX IF NOT EXISTS wa_messages_provider_id_idx ON wa_messages (provider_message_id) WHERE provider_message_id IS NOT NULL;
       CREATE INDEX IF NOT EXISTS wa_messages_phone_idx ON wa_messages (phone, created_at DESC);
@@ -112,6 +119,24 @@ export class PrismaStore implements Store {
         expires_at TIMESTAMPTZ NOT NULL
       );
       CREATE INDEX IF NOT EXISTS wa_conversations_expires_idx ON wa_conversations (expires_at);
+      CREATE TABLE IF NOT EXISTS wa_customer_memory (
+        phone TEXT PRIMARY KEY,
+        summary TEXT NOT NULL DEFAULT '',
+        last_intent TEXT,
+        last_order_number TEXT,
+        active_ticket_id UUID,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      ALTER TABLE wa_customer_memory ADD COLUMN IF NOT EXISTS customer_name TEXT;
+      ALTER TABLE wa_customer_memory ADD COLUMN IF NOT EXISTS name_source TEXT;
+      ALTER TABLE wa_customer_memory ADD COLUMN IF NOT EXISTS shopify_customer_id TEXT;
+      ALTER TABLE wa_customer_memory ADD COLUMN IF NOT EXISTS current_issue TEXT;
+      ALTER TABLE wa_customer_memory ADD COLUMN IF NOT EXISTS known_order_numbers JSONB NOT NULL DEFAULT '[]';
+      ALTER TABLE wa_customer_memory ADD COLUMN IF NOT EXISTS issue_history JSONB NOT NULL DEFAULT '[]';
+      ALTER TABLE wa_customer_memory ADD COLUMN IF NOT EXISTS archive_summary TEXT;
+      ALTER TABLE wa_customer_memory ADD COLUMN IF NOT EXISTS archived_through_message_id BIGINT;
+      ALTER TABLE wa_customer_memory ADD COLUMN IF NOT EXISTS profile JSONB NOT NULL DEFAULT '{}';
+      CREATE INDEX IF NOT EXISTS wa_customer_memory_updated_idx ON wa_customer_memory (updated_at DESC);
       CREATE TABLE IF NOT EXISTS wa_bot_pauses (
         phone TEXT PRIMARY KEY,
         reason TEXT NOT NULL CHECK (reason IN ('manual', 'agent_message')),
@@ -129,6 +154,12 @@ export class PrismaStore implements Store {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         resolved_at TIMESTAMPTZ
       );
+      ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}';
+      ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+      ALTER TABLE support_tickets DROP CONSTRAINT IF EXISTS support_tickets_category_check;
+      ALTER TABLE support_tickets ADD CONSTRAINT support_tickets_category_check CHECK (category IN ('refund', 'return', 'missing', 'address_change', 'contact_request', 'other'));
+      ALTER TABLE support_tickets DROP CONSTRAINT IF EXISTS support_tickets_status_check;
+      ALTER TABLE support_tickets ADD CONSTRAINT support_tickets_status_check CHECK (status IN ('awaiting_email', 'open', 'resolved'));
       CREATE INDEX IF NOT EXISTS support_tickets_status_created_idx ON support_tickets (status, created_at DESC);
       UPDATE wa_conversations
       SET expires_at = updated_at + INTERVAL '24 hours'
@@ -258,10 +289,10 @@ export class PrismaStore implements Store {
 
   async addWhatsAppMessage(message: Omit<WhatsAppMessage, "id" | "createdAt">) {
     const rowCount = await this.prisma.$executeRawUnsafe(
-      `INSERT INTO wa_messages (phone, direction, message_text, intent, order_number, provider_message_id, sender_type, ai_provider)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      `INSERT INTO wa_messages (phone, direction, message_text, intent, order_number, provider_message_id, sender_type, ai_provider, message_type)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        ON CONFLICT (provider_message_id) WHERE provider_message_id IS NOT NULL DO NOTHING`,
-      message.phone, message.direction, message.text, message.intent || null, message.orderNumber || null, message.providerMessageId || null, message.source || (message.direction === "inbound" ? "customer" : "bot"), message.aiProvider || null,
+      message.phone, message.direction, message.text, message.intent || null, message.orderNumber || null, message.providerMessageId || null, message.source || (message.direction === "inbound" ? "customer" : "bot"), message.aiProvider || null, message.messageType || "text",
     );
     return rowCount === 1;
   }
@@ -269,10 +300,15 @@ export class PrismaStore implements Store {
   async getConversationHistory(phone: string, limit: number) {
     const safeLimit = Math.max(1, Math.min(50, Math.trunc(limit)));
     const rows = await this.prisma.$queryRawUnsafe<{ id: bigint; phone: string; direction: WhatsAppMessage["direction"]; message_text: string; intent: SupportIntent | null; order_number: string | null; provider_message_id: string | null; sender_type: WhatsAppMessage["source"]; ai_provider: WhatsAppMessage["aiProvider"] | null; created_at: Date }[]>(
-      "SELECT id, phone, direction, message_text, intent, order_number, provider_message_id, sender_type, ai_provider, created_at FROM wa_messages WHERE phone = $1 ORDER BY created_at DESC LIMIT $2",
+      "SELECT id, phone, direction, message_text, intent, order_number, provider_message_id, sender_type, ai_provider, message_type, created_at FROM wa_messages WHERE phone = $1 ORDER BY created_at DESC LIMIT $2",
       phone, safeLimit,
     );
     return rows.reverse().map(mapWhatsAppMessage);
+  }
+
+  async getCompleteConversationHistory(phone: string) {
+    const rows = await this.prisma.$queryRawUnsafe<any[]>("SELECT id, phone, direction, message_text, intent, order_number, provider_message_id, sender_type, ai_provider, message_type, created_at FROM wa_messages WHERE phone = $1 ORDER BY created_at ASC, id ASC", phone);
+    return rows.map(mapWhatsAppMessage);
   }
 
   async incrementAiTurnCount(phone: string) {
@@ -280,11 +316,6 @@ export class PrismaStore implements Store {
     const count = Number(conversation?.context.aiTurnCount || 0) + 1;
     await this.saveConversation({ phone, step: "ai_active", context: { ...(conversation?.step === "ai_active" ? conversation.context : {}), aiTurnCount: count } });
     return count;
-  }
-
-  async getAiTurnCount(phone: string) {
-    const conversation = await this.getConversation(phone);
-    return conversation?.step === "ai_active" ? Number(conversation.context.aiTurnCount || 0) : 0;
   }
 
   async getConversation(phone: string) {
@@ -307,6 +338,30 @@ export class PrismaStore implements Store {
 
   async clearConversation(phone: string) {
     await this.prisma.$executeRawUnsafe("DELETE FROM wa_conversations WHERE phone = $1", phone);
+  }
+
+  async getCustomerMemory(phone: string) {
+    const rows = await this.prisma.$queryRawUnsafe<any[]>("SELECT phone, customer_name, name_source, shopify_customer_id, summary, current_issue, known_order_numbers, issue_history, archive_summary, archived_through_message_id, profile, last_intent, last_order_number, active_ticket_id, updated_at FROM wa_customer_memory WHERE phone = $1", phone);
+    return rows[0] ? mapCustomerMemory(rows[0]) : undefined;
+  }
+
+  async getCustomerMemories() {
+    const rows = await this.prisma.$queryRawUnsafe<any[]>("SELECT phone, customer_name, name_source, shopify_customer_id, summary, current_issue, known_order_numbers, issue_history, archive_summary, archived_through_message_id, profile, last_intent, last_order_number, active_ticket_id, updated_at FROM wa_customer_memory ORDER BY updated_at DESC LIMIT 500");
+    return rows.map(mapCustomerMemory);
+  }
+
+  async saveCustomerMemory(memory: Omit<CustomerMemory, "updatedAt">) {
+    await this.prisma.$executeRawUnsafe(
+      `INSERT INTO wa_customer_memory (phone, customer_name, name_source, shopify_customer_id, summary, current_issue, known_order_numbers, issue_history, archive_summary, archived_through_message_id, profile, last_intent, last_order_number, active_ticket_id, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, $10::bigint, $11::jsonb, $12, $13, $14, NOW())
+       ON CONFLICT (phone) DO UPDATE SET customer_name = EXCLUDED.customer_name, name_source = EXCLUDED.name_source, shopify_customer_id = EXCLUDED.shopify_customer_id, summary = EXCLUDED.summary, current_issue = EXCLUDED.current_issue, known_order_numbers = EXCLUDED.known_order_numbers, issue_history = EXCLUDED.issue_history, archive_summary = EXCLUDED.archive_summary, archived_through_message_id = EXCLUDED.archived_through_message_id, profile = EXCLUDED.profile, last_intent = EXCLUDED.last_intent, last_order_number = EXCLUDED.last_order_number, active_ticket_id = EXCLUDED.active_ticket_id, updated_at = NOW()`,
+      memory.phone, memory.customerName || null, memory.nameSource || null, memory.shopifyCustomerId || null, memory.summary, memory.currentIssue || null, JSON.stringify(memory.knownOrderNumbers), JSON.stringify(memory.issueHistory), memory.archiveSummary || null, memory.archivedThroughMessageId || null, JSON.stringify(memory.profile), memory.lastIntent || null, memory.lastOrderNumber || null, memory.activeTicketId || null,
+    );
+  }
+
+  async getCustomerChatContext(phone: string): Promise<CustomerChatContext> {
+    const [memory, messages, ticketRows] = await Promise.all([this.getCustomerMemory(phone), this.getCompleteConversationHistory(phone), this.prisma.$queryRawUnsafe<any[]>("SELECT ticket_id, phone, order_number, category, description, status, metadata, created_at, updated_at, resolved_at FROM support_tickets WHERE phone = $1 ORDER BY created_at ASC", phone)]);
+    return { version: 1, phone, customer: memory || emptyCustomerMemory(phone), messages, tickets: ticketRows.map(mapSupportTicket), generatedAt: new Date().toISOString() };
   }
 
   async isBotPaused(phone: string) {
@@ -345,27 +400,46 @@ export class PrismaStore implements Store {
 
   async createSupportTicket(ticket: SupportTicket) {
     await this.prisma.$executeRawUnsafe(
-      `INSERT INTO support_tickets (ticket_id, phone, order_number, category, description, status, created_at, resolved_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (ticket_id) DO NOTHING`,
-      ticket.ticketId, ticket.phone, ticket.orderNumber || null, ticket.category, ticket.description || null, ticket.status, ticket.createdAt, ticket.resolvedAt || null,
+      `INSERT INTO support_tickets (ticket_id, phone, order_number, category, description, status, metadata, created_at, updated_at, resolved_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10) ON CONFLICT (ticket_id) DO NOTHING`,
+      ticket.ticketId, ticket.phone, ticket.orderNumber || null, ticket.category, ticket.description || null, ticket.status, JSON.stringify(ticket.metadata || {}), ticket.createdAt, ticket.updatedAt || ticket.createdAt, ticket.resolvedAt || null,
     );
+  }
+
+  async findOpenSupportTicket(phone: string, category: SupportTicket["category"], orderNumber?: string) {
+    const rows = await this.prisma.$queryRawUnsafe<any[]>(
+      `SELECT ticket_id, phone, order_number, category, description, status, metadata, created_at, updated_at, resolved_at FROM support_tickets
+       WHERE phone = $1 AND category = $2 AND status <> 'resolved' AND ($3::text IS NULL OR order_number = $3 OR order_number IS NULL)
+       ORDER BY CASE WHEN order_number = $3 THEN 0 ELSE 1 END, updated_at DESC LIMIT 1`, phone, category, orderNumber || null,
+    );
+    return rows[0] ? mapSupportTicket(rows[0]) : undefined;
+  }
+
+  async updateSupportTicketDetails(ticketId: string, updates: { orderNumber?: string; description?: string; metadata?: Record<string, unknown>; status?: SupportTicketStatus }) {
+    const rowCount = await this.prisma.$executeRawUnsafe(
+      `UPDATE support_tickets SET order_number = COALESCE($2, order_number), description = COALESCE($3, description), metadata = metadata || $4::jsonb,
+       status = COALESCE($5, status), updated_at = NOW(), resolved_at = CASE WHEN $5 = 'resolved' THEN NOW() WHEN $5 IS NOT NULL THEN NULL ELSE resolved_at END WHERE ticket_id = $1`,
+      ticketId, updates.orderNumber || null, updates.description || null, JSON.stringify(updates.metadata || {}), updates.status || null,
+    );
+    return rowCount === 1;
   }
 
   async updateSupportTicket(ticketId: string, status: SupportTicketStatus) {
     const rowCount = await this.prisma.$executeRawUnsafe(
-      "UPDATE support_tickets SET status = $2, resolved_at = CASE WHEN $2 = 'resolved' THEN NOW() ELSE NULL END WHERE ticket_id = $1",
+      "UPDATE support_tickets SET status = $2, updated_at = NOW(), resolved_at = CASE WHEN $2 = 'resolved' THEN NOW() ELSE NULL END WHERE ticket_id = $1",
       ticketId, status,
     );
     return rowCount === 1;
   }
 
   async getSupportOverview(): Promise<SupportOverview> {
-    const [messageResult, ticketResult, conversationResult, pauseResult, statsResult] = await Promise.all([
+    const [messageResult, customerResult, ticketResult, conversationResult, pauseResult, statsResult] = await Promise.all([
       this.prisma.$queryRawUnsafe<{ id: bigint; phone: string; direction: WhatsAppMessage["direction"]; message_text: string; intent: SupportIntent | null; order_number: string | null; provider_message_id: string | null; sender_type: WhatsAppMessage["source"]; ai_provider: WhatsAppMessage["aiProvider"] | null; created_at: Date }[]>(
-        "SELECT id, phone, direction, message_text, intent, order_number, provider_message_id, sender_type, ai_provider, created_at FROM wa_messages ORDER BY created_at DESC LIMIT 200",
+        "SELECT id, phone, direction, message_text, intent, order_number, provider_message_id, sender_type, ai_provider, message_type, created_at FROM wa_messages ORDER BY created_at DESC LIMIT 200",
       ),
+      this.getCustomerMemories(),
       this.prisma.$queryRawUnsafe<{ ticket_id: string; phone: string; order_number: string | null; category: SupportTicket["category"]; description: string | null; status: SupportTicketStatus; created_at: Date; resolved_at: Date | null }[]>(
-        "SELECT ticket_id, phone, order_number, category, description, status, created_at, resolved_at FROM support_tickets ORDER BY created_at DESC LIMIT 100",
+        "SELECT ticket_id, phone, order_number, category, description, status, metadata, created_at, updated_at, resolved_at FROM support_tickets ORDER BY created_at DESC LIMIT 100",
       ),
       this.prisma.$queryRawUnsafe<{ phone: string; intent: SupportIntent | null; step: SupportConversation["step"]; context: any; updated_at: Date; expires_at: Date }[]>(
         "SELECT phone, intent, step, context, updated_at, expires_at FROM wa_conversations WHERE expires_at > NOW() ORDER BY updated_at DESC LIMIT 100",
@@ -378,13 +452,14 @@ export class PrismaStore implements Store {
           (SELECT COUNT(*)::int FROM wa_messages WHERE direction = 'inbound' AND created_at >= CURRENT_DATE) AS inbound_today,
           (SELECT COUNT(*)::int FROM wa_messages WHERE direction = 'outbound' AND created_at >= CURRENT_DATE) AS outbound_today,
           (SELECT COUNT(*)::int FROM wa_conversations WHERE expires_at > NOW()) AS active_conversations,
-          (SELECT COUNT(*)::int FROM support_tickets WHERE status = 'open') AS open_tickets`,
+          (SELECT COUNT(*)::int FROM support_tickets WHERE status <> 'resolved') AS open_tickets`,
       ),
     ]);
     const stats = statsResult[0];
     return {
       messages: messageResult.map(mapWhatsAppMessage),
-      tickets: ticketResult.map((row: any) => ({ ticketId: row.ticket_id, phone: row.phone, ...(row.order_number ? { orderNumber: row.order_number } : {}), category: row.category, ...(row.description ? { description: row.description } : {}), status: row.status, createdAt: row.created_at.toISOString(), ...(row.resolved_at ? { resolvedAt: row.resolved_at.toISOString() } : {}) })),
+      customers: customerResult,
+      tickets: ticketResult.map(mapSupportTicket),
       conversations: conversationResult.map((row: any) => ({ phone: row.phone, ...(row.intent ? { intent: row.intent } : {}), step: row.step, context: typeof row.context === "string" ? JSON.parse(row.context) : row.context, updatedAt: row.updated_at.toISOString(), expiresAt: row.expires_at.toISOString() })),
       botPauses: pauseResult.map((row) => ({ phone: row.phone, reason: row.reason, pausedAt: row.paused_at.toISOString(), expiresAt: row.expires_at.toISOString() })),
       stats: { inboundToday: stats.inbound_today, outboundToday: stats.outbound_today, activeConversations: stats.active_conversations, openTickets: stats.open_tickets },
@@ -395,6 +470,16 @@ export class PrismaStore implements Store {
 
 }
 
-function mapWhatsAppMessage(row: { id: bigint; phone: string; direction: WhatsAppMessage["direction"]; message_text: string; intent: SupportIntent | null; order_number: string | null; provider_message_id: string | null; sender_type: WhatsAppMessage["source"]; ai_provider: WhatsAppMessage["aiProvider"] | null; created_at: Date }): WhatsAppMessage {
-  return { id: row.id.toString(), phone: row.phone, direction: row.direction, text: row.message_text, ...(row.intent ? { intent: row.intent } : {}), ...(row.order_number ? { orderNumber: row.order_number } : {}), ...(row.provider_message_id ? { providerMessageId: row.provider_message_id } : {}), ...(row.sender_type ? { source: row.sender_type } : {}), ...(row.ai_provider ? { aiProvider: row.ai_provider } : {}), createdAt: row.created_at.toISOString() };
+function mapWhatsAppMessage(row: any): WhatsAppMessage {
+  return { id: row.id.toString(), phone: row.phone, direction: row.direction, text: row.message_text, ...(row.intent ? { intent: row.intent } : {}), ...(row.order_number ? { orderNumber: row.order_number } : {}), ...(row.provider_message_id ? { providerMessageId: row.provider_message_id } : {}), ...(row.sender_type ? { source: row.sender_type } : {}), ...(row.ai_provider ? { aiProvider: row.ai_provider } : {}), messageType: row.message_type || "text", createdAt: row.created_at.toISOString() };
+}
+
+function mapSupportTicket(row: any): SupportTicket {
+  return { ticketId: row.ticket_id, phone: row.phone, ...(row.order_number ? { orderNumber: row.order_number } : {}), category: row.category, ...(row.description ? { description: row.description } : {}), status: row.status, metadata: typeof row.metadata === "string" ? JSON.parse(row.metadata) : (row.metadata || {}), createdAt: row.created_at.toISOString(), updatedAt: (row.updated_at || row.created_at).toISOString(), ...(row.resolved_at ? { resolvedAt: row.resolved_at.toISOString() } : {}) };
+}
+
+function emptyCustomerMemory(phone: string): CustomerMemory { return { phone, summary: "", knownOrderNumbers: [], issueHistory: [], profile: {}, updatedAt: new Date(0).toISOString() }; }
+function mapCustomerMemory(row: any): CustomerMemory {
+  const json = <T>(value: unknown, fallback: T): T => { if (value === null || value === undefined) return fallback; if (typeof value !== "string") return value as T; try { return JSON.parse(value) as T; } catch { return fallback; } };
+  return { phone: row.phone, ...(row.customer_name ? { customerName: row.customer_name } : {}), ...(row.name_source === "shopify" || row.name_source === "whatsapp" ? { nameSource: row.name_source } : {}), ...(row.shopify_customer_id ? { shopifyCustomerId: row.shopify_customer_id } : {}), summary: row.summary || "", ...(row.current_issue ? { currentIssue: row.current_issue } : {}), knownOrderNumbers: json<string[]>(row.known_order_numbers, []), issueHistory: json<CustomerMemory["issueHistory"]>(row.issue_history, []), ...(row.archive_summary ? { archiveSummary: row.archive_summary } : {}), ...(row.archived_through_message_id !== null && row.archived_through_message_id !== undefined ? { archivedThroughMessageId: String(row.archived_through_message_id) } : {}), profile: json<Record<string, unknown>>(row.profile, {}), ...(row.last_intent ? { lastIntent: row.last_intent } : {}), ...(row.last_order_number ? { lastOrderNumber: row.last_order_number } : {}), ...(row.active_ticket_id ? { activeTicketId: row.active_ticket_id } : {}), updatedAt: row.updated_at.toISOString() };
 }

@@ -20,7 +20,7 @@ type GraphQlOrder = {
   currentTotalPriceSet: { shopMoney: { amount: string; currencyCode: string } };
   shippingAddress?: ShopifyAddress;
   billingAddress?: { phone?: string };
-  customer?: { defaultPhoneNumber?: { phoneNumber?: string } };
+  customer?: { id: string; firstName?: string; lastName?: string; defaultPhoneNumber?: { phoneNumber?: string } };
   lineItems: { nodes: Array<{ title: string; quantity: number; sku?: string }> };
   fulfillments: Array<{ trackingInfo: Array<{ number?: string; url?: string; company?: string }> }>;
 };
@@ -38,7 +38,7 @@ const SUPPORT_ORDERS_QUERY = `#graphql
         currentTotalPriceSet { shopMoney { amount currencyCode } }
         shippingAddress { name firstName lastName phone address1 address2 city province provinceCode zip country countryCodeV2 }
         billingAddress { phone }
-        customer { defaultPhoneNumber { phoneNumber } }
+        customer { id firstName lastName defaultPhoneNumber { phoneNumber } }
         lineItems(first: 20) { nodes { title quantity sku } }
         fulfillments { trackingInfo { number url company } }
       }
@@ -62,7 +62,7 @@ const CUSTOMER_ORDERS_BY_PHONE_QUERY = `#graphql
           currentTotalPriceSet { shopMoney { amount currencyCode } }
           shippingAddress { name firstName lastName phone address1 address2 city province provinceCode zip country countryCodeV2 }
           billingAddress { phone }
-          customer { defaultPhoneNumber { phoneNumber } }
+          customer { id firstName lastName defaultPhoneNumber { phoneNumber } }
           lineItems(first: 20) { nodes { title quantity sku } }
           fulfillments { trackingInfo { number url company } }
         }
@@ -89,7 +89,7 @@ const CUSTOMERS_BY_PHONE_SEARCH_QUERY = `#graphql
             currentTotalPriceSet { shopMoney { amount currencyCode } }
             shippingAddress { name firstName lastName phone address1 address2 city province provinceCode zip country countryCodeV2 }
             billingAddress { phone }
-            customer { defaultPhoneNumber { phoneNumber } }
+            customer { id firstName lastName defaultPhoneNumber { phoneNumber } }
             lineItems(first: 20) { nodes { title quantity sku } }
             fulfillments { trackingInfo { number url company } }
           }
@@ -197,6 +197,8 @@ export class ShopifyClient {
     return orders.map((order) => ({
       id: order.id,
       name: order.name,
+      ...(order.customer?.id ? { shopifyCustomerId: order.customer.id } : {}),
+      ...((order.shippingAddress?.name || [order.customer?.firstName, order.customer?.lastName].filter(Boolean).join(" ")) ? { customerName: order.shippingAddress?.name || [order.customer?.firstName, order.customer?.lastName].filter(Boolean).join(" ") } : {}),
       createdAt: order.createdAt,
       displayFinancialStatus: order.displayFinancialStatus,
       displayFulfillmentStatus: order.displayFulfillmentStatus,

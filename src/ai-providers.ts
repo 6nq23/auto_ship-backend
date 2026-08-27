@@ -35,8 +35,14 @@ export class AiOrchestrator {
   async chat(messages: ChatMessage[], systemPrompt: string) {
     const failures: AiExhaustedError["failures"] = [];
     for (const provider of this.providers) {
-      try { return { ...(await provider.chat(messages, systemPrompt)), provider: provider.name }; }
-      catch (error) { failures.push({ provider: provider.name, error: error instanceof Error ? error.message : String(error) }); }
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const retryMessages = attempt ? [...messages, { role: "user" as const, content: "Your previous output was invalid. Return one complete JSON object matching the required response contract. Do not use markdown." }] : messages;
+          return { ...(await provider.chat(retryMessages, systemPrompt)), provider: provider.name };
+        } catch (error) {
+          if (attempt === 1) failures.push({ provider: provider.name, error: error instanceof Error ? error.message : String(error) });
+        }
+      }
     }
     throw new AiExhaustedError(failures);
   }
@@ -45,7 +51,7 @@ export class AiOrchestrator {
 export function createAiOrchestrator(config: ProviderConfig) {
   const providers: AiProvider[] = [];
   if (config.geminiApiKey) providers.push(new GeminiProvider(config.geminiApiKey, config.geminiModel || "gemini-2.5-flash"));
-  if (config.claudeApiKey) providers.push(new ClaudeProvider(config.claudeApiKey, config.claudeModel || "claude-sonnet-4-20250514"));
+  if (config.claudeApiKey) providers.push(new ClaudeProvider(config.claudeApiKey, config.claudeModel || "claude-opus-5"));
   if (config.openaiApiKey) providers.push(new OpenAiProvider(config.openaiApiKey, config.openaiModel || "gpt-4.1-mini"));
   return new AiOrchestrator(providers, config.primaryProvider);
 }
@@ -60,7 +66,7 @@ class GeminiProvider implements AiProvider {
       {
         systemInstruction: { parts: [{ text: systemPrompt }] },
         contents: messages.map((message) => ({ role: message.role === "assistant" ? "model" : "user", parts: [{ text: message.content }] })),
-        generationConfig: { maxOutputTokens: 500, responseMimeType: "application/json" },
+        generationConfig: { maxOutputTokens: 700, responseMimeType: "application/json", responseSchema: AI_RESPONSE_SCHEMA },
       },
       { "x-goog-api-key": this.apiKey },
     );
@@ -73,13 +79,21 @@ class ClaudeProvider implements AiProvider {
   constructor(private readonly apiKey: string, private readonly model: string) {}
 
   async chat(messages: ChatMessage[], systemPrompt: string) {
+    // Claude 5 models think by default, and thinking shares max_tokens with the reply,
+    // so the budget is well above what the JSON answer alone needs. Support routing is a
+    // simple task, so low effort keeps the thinking spend and latency down.
     const body = await postJson("https://api.anthropic.com/v1/messages", {
       model: this.model,
-      max_tokens: 500,
+      max_tokens: 4_000,
+      output_config: { effort: "low" },
       system: systemPrompt,
       messages,
-    }, { "x-api-key": this.apiKey, "anthropic-version": "2023-06-01" });
-    return parseAiResponse(readString(body, ["content", 0, "text"]));
+    }, { "x-api-key": this.apiKey, "anthropic-version": "2023-06-01" }) as { stop_reason?: string; content?: Array<{ type?: string; text?: string }> };
+    if (body.stop_reason === "refusal") throw new Error("Claude declined to answer this message");
+    // Thinking blocks come before the reply, so the answer is not always content[0].
+    const reply = body.content?.find((block) => block.type === "text")?.text;
+    if (typeof reply !== "string" || !reply.trim()) throw new Error("AI provider returned an empty response");
+    return parseAiResponse(reply);
   }
 }
 
@@ -121,7 +135,10 @@ export function parseAiResponse(raw: string): AiResponse {
   const cleaned = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
   let value: unknown;
   try { value = JSON.parse(cleaned); }
-  catch { return { text: cleaned.slice(0, 2_000), resolved: false }; }
+  catch {
+    if (/^[{[]/.test(cleaned)) throw new Error("AI returned malformed JSON");
+    return { text: cleaned.slice(0, 2_000), resolved: false };
+  }
   if (!value || typeof value !== "object") return { text: cleaned.slice(0, 2_000), resolved: false };
   const record = value as Record<string, unknown>;
   const toolCalls = Array.isArray(record.toolCalls)
@@ -134,8 +151,24 @@ export function parseAiResponse(raw: string): AiResponse {
     ...(toolCalls.length ? { toolCalls } : {}),
     resolved: record.resolved === true,
     escalate: record.escalate === true,
+    ...(typeof record.intent === "string" && SUPPORT_INTENTS.has(record.intent) ? { intent: record.intent as AiResponse["intent"] } : {}),
+    ...(typeof record.summary === "string" && record.summary.trim() ? { summary: record.summary.trim().slice(0, 2_000) } : {}),
   };
 }
+
+const SUPPORT_INTENTS = new Set(["confirm_order", "change_address", "order_status", "not_dispatched", "order_failed", "refund_return", "product_inquiry", "additional_purchase", "real_picture_request", "contact_request"]);
+const AI_RESPONSE_SCHEMA = {
+  type: "OBJECT",
+  properties: {
+    text: { type: "STRING" },
+    toolCalls: { type: "ARRAY", items: { type: "OBJECT", properties: { name: { type: "STRING" }, arguments: { type: "OBJECT", properties: { identifier: { type: "STRING" }, phone: { type: "STRING" }, intent: { type: "STRING" }, reason: { type: "STRING" }, category: { type: "STRING" }, order_number: { type: "STRING" } } } }, required: ["name", "arguments"] } },
+    resolved: { type: "BOOLEAN" },
+    escalate: { type: "BOOLEAN" },
+    intent: { type: "STRING" },
+    summary: { type: "STRING" },
+  },
+  required: ["text", "resolved", "escalate", "summary"],
+};
 
 function asArguments(value: unknown): Record<string, unknown> {
   if (value && typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;

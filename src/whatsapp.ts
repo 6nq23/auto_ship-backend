@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 
 export type WhatsAppProvider = "disabled" | "meta" | "whapi" | "getgabs";
-export type IncomingWhatsAppMessage = { id: string; phone: string; text: string };
+export type IncomingWhatsAppMessage = { id: string; phone: string; text: string; messageType?: "text" | "image"; customerName?: string };
 type WhatsAppConfig = {
   provider: WhatsAppProvider;
   accessToken: string;
@@ -70,11 +70,14 @@ export class WhatsAppClient {
       const message = candidate as Record<string, unknown>;
       if (message.from_me === true || message.fromMe === true || message.direction === "outbound") return [];
       const textObject = message.text as Record<string, unknown> | string | undefined;
+      const messageType = /image/i.test(String(message.message_type || message.type || "")) ? "image" as const : "text" as const;
       const getgabsText = this.extractGetgabsText(message.message_text);
-      const text = typeof textObject === "string" ? textObject : String(textObject?.body || getgabsText || message.body || message.message || "");
+      const image = (message.image || {}) as Record<string, unknown>;
+      const text = typeof textObject === "string" ? textObject : String(textObject?.body || getgabsText || image.caption || message.caption || message.body || message.message || (messageType === "image" ? "[Customer sent an image]" : ""));
       const phone = String(message.from || message.message_from || message.chat_id || message.chatId || "").split("@")[0].replace(/\D/g, "");
       const id = String(message.id || message.message_id || message.messageId || "");
-      return phone && text ? [{ id: id || crypto.randomUUID(), phone, text: text.trim() }] : [];
+      const customerName = String(message.contact_name || message.profile_name || message.sender_name || message.name || "").trim();
+      return phone && text ? [{ id: id || crypto.randomUUID(), phone, text: text.trim(), messageType, ...(customerName ? { customerName } : {}) }] : [];
     });
   }
 
@@ -168,14 +171,19 @@ export class WhatsAppClient {
       return changes.flatMap((change) => {
         const value = ((change as Record<string, unknown>).value || {}) as Record<string, unknown>;
         const messages = Array.isArray(value.messages) ? value.messages : [];
+        const contacts = Array.isArray(value.contacts) ? value.contacts as Array<Record<string, unknown>> : [];
         return messages.flatMap((candidate) => {
           const message = candidate as Record<string, unknown>;
           const interactive = (message.interactive || {}) as Record<string, unknown>;
           const button = (interactive.button_reply || {}) as Record<string, unknown>;
           const list = (interactive.list_reply || {}) as Record<string, unknown>;
-          const text = String((message.text as Record<string, unknown> | undefined)?.body || button.id || list.id || "").trim();
+          const image = (message.image || {}) as Record<string, unknown>;
+          const messageType = message.type === "image" ? "image" as const : "text" as const;
+          const text = String((message.text as Record<string, unknown> | undefined)?.body || image.caption || button.id || list.id || (messageType === "image" ? "[Customer sent an image]" : "")).trim();
           const phone = String(message.from || "").replace(/\D/g, "");
-          return phone && text ? [{ id: String(message.id || crypto.randomUUID()), phone, text }] : [];
+          const contact = contacts.find((item) => String(item.wa_id || "").replace(/\D/g, "") === phone);
+          const customerName = String((contact?.profile as Record<string, unknown> | undefined)?.name || "").trim();
+          return phone && text ? [{ id: String(message.id || crypto.randomUUID()), phone, text, messageType, ...(customerName ? { customerName } : {}) }] : [];
         });
       });
     });
@@ -191,7 +199,8 @@ export class WhatsAppClient {
       const interactive = (parsed.interactive || {}) as Record<string, unknown>;
       const buttonReply = (interactive.button_reply || {}) as Record<string, unknown>;
       const listReply = (interactive.list_reply || {}) as Record<string, unknown>;
-      return String(button.payload || button.text || buttonReply.id || buttonReply.title || listReply.id || listReply.title || "").trim();
+      const image = (parsed.image || {}) as Record<string, unknown>;
+      return String(button.payload || button.text || buttonReply.id || buttonReply.title || listReply.id || listReply.title || image.caption || parsed.caption || "").trim();
     } catch {
       return trimmed;
     }
